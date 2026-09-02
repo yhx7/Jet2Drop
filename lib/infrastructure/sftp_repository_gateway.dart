@@ -67,7 +67,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
         onTimeout: () => throw TimeoutException('SFTP handshake timed out.'),
       );
       return _sftp!;
-    } catch (_) {
+    } catch (exception) {
       client.close();
       _client = null;
       rethrow;
@@ -85,6 +85,67 @@ class SftpRepositoryGateway implements RepositoryGateway {
   }
 
   @override
+  Future<int?> availableBytes(String relativePath) async {
+    try {
+      final stats = await _withOperationTimeout(
+        (await _connection).statvfs(_remote(relativePath)),
+        'Checking available space',
+      );
+      return stats.freeBlocksForNonRoot * stats.fundamentalBlockSize;
+    } catch (exception) {
+      // Some SFTP servers do not expose the optional statvfs extension.
+      return null;
+    }
+  }
+
+  @override
+  Future<void> recoverTemporaryFiles(String relativePath) async {
+    final sftp = await _connection;
+    final directory = _remote(relativePath);
+    final cutoff = DateTime.now().subtract(const Duration(days: 7));
+    final entries = await _withOperationTimeout(
+      sftp.listdir(directory),
+      'Checking temporary files',
+    );
+    for (final entry in entries) {
+      if (entry.attr.mode?.type == SftpFileType.directory) continue;
+      final name = entry.filename;
+      final backupIndex = name.indexOf('.jet2drop-backup-');
+      final path = directory == '/' ? '/$name' : '$directory/$name';
+      if (backupIndex >= 0) {
+        final originalName = name.substring(0, backupIndex);
+        final original = directory == '/'
+            ? '/$originalName'
+            : '$directory/$originalName';
+        var originalExists = false;
+        try {
+          await sftp.stat(original);
+          originalExists = true;
+        } catch (_) {}
+        if (!originalExists) {
+          await sftp.rename(path, original);
+        } else if (_isOlderThan(entry.attr.modifyTime, cutoff)) {
+          await sftp.remove(path);
+        }
+        continue;
+      }
+      if ((name.contains('.jet2drop-upload-') ||
+              name.contains('.jet2drop-download-')) &&
+          name.endsWith('.part') &&
+          _isOlderThan(entry.attr.modifyTime, cutoff)) {
+        await sftp.remove(path);
+      }
+    }
+  }
+
+  bool _isOlderThan(int? secondsSinceEpoch, DateTime cutoff) =>
+      secondsSinceEpoch != null &&
+      DateTime.fromMillisecondsSinceEpoch(
+        secondsSinceEpoch * 1000,
+        isUtc: true,
+      ).isBefore(cutoff.toUtc());
+
+  @override
   Future<List<FileEntry>> listDirectory(String relativePath) async {
     final sftp = await _connection;
     final names = await _withOperationTimeout(
@@ -95,6 +156,9 @@ class SftpRepositoryGateway implements RepositoryGateway {
         .where((item) => item.filename != '.' && item.filename != '..')
         .where((item) => item.filename != '__jet2drop_transfer')
         .where((item) => !item.filename.startsWith('.jet2drop-'))
+        .where((item) => !item.filename.contains('.jet2drop-upload-'))
+        .where((item) => !item.filename.contains('.jet2drop-download-'))
+        .where((item) => !item.filename.contains('.jet2drop-backup-'))
         .map((item) {
           final isDirectory = item.attr.mode?.type == SftpFileType.directory;
           return FileEntry(
@@ -170,6 +234,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
     required String targetDirectory,
     required String targetName,
     required bool overwrite,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   }) async {
@@ -179,51 +244,139 @@ class SftpRepositoryGateway implements RepositoryGateway {
     }
     final sftp = await _connection;
     final destination = _remote(joinRelativePath(targetDirectory, cleanName));
-    final temporary = '$destination.jet2drop-upload-${uniqueSuffix()}.part';
+    final safeResumeId = resumeId == null
+        ? uniqueSuffix()
+        : resumeId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final temporary = '$destination.jet2drop-upload-$safeResumeId.part';
     final total = await source.length();
+    var offset = 0;
+    if (resumeId != null) {
+      try {
+        offset = (await sftp.stat(temporary)).size ?? 0;
+      } catch (_) {}
+      if (offset > total) {
+        try {
+          await sftp.remove(temporary);
+        } catch (_) {}
+        offset = 0;
+      }
+    }
     final handle = await _withOperationTimeout(
       sftp.open(
         temporary,
-        mode:
-            SftpFileOpenMode.create |
-            SftpFileOpenMode.truncate |
-            SftpFileOpenMode.write,
+        mode: offset == 0
+            ? SftpFileOpenMode.create |
+                  SftpFileOpenMode.truncate |
+                  SftpFileOpenMode.write
+            : SftpFileOpenMode.create | SftpFileOpenMode.write,
       ),
       'Preparing upload',
     );
     try {
+      Timer? inactivityTimer;
+      final inactivity = Completer<void>();
+      void resetInactivityTimer() {
+        inactivityTimer?.cancel();
+        inactivityTimer = Timer(_operationTimeout, () {
+          if (!inactivity.isCompleted) {
+            inactivity.completeError(
+              TimeoutException(
+                'Uploading file made no progress for ${_operationTimeout.inSeconds} seconds.',
+              ),
+            );
+          }
+        });
+      }
+
       final writer = handle.write(
-        source.openRead().asyncExpand((chunk) async* {
+        source.openRead(offset).asyncExpand((chunk) async* {
           await control?.checkpoint();
           yield Uint8List.fromList(chunk);
         }),
         onProgress: (value) {
-          onProgress?.call(value, total);
+          resetInactivityTimer();
+          onProgress?.call(offset + value, total);
         },
+        offset: offset,
       );
+      onProgress?.call(offset, total);
+      resetInactivityTimer();
       control?.bind(
         onPause: writer.pause,
         onResume: writer.resume,
         onCancel: writer.abort,
       );
-      await _withOperationTimeout(writer.done, 'Uploading file');
+      try {
+        await Future.any<void>([writer.done, inactivity.future]);
+      } finally {
+        inactivityTimer?.cancel();
+      }
       await control?.checkpoint();
       await _withOperationTimeout(handle.close(), 'Finalizing upload');
-      await _withOperationTimeout(
-        sftp.rename(temporary, destination),
-        'Publishing upload',
-      );
-    } catch (_) {
+      var destinationExists = false;
+      try {
+        await sftp.stat(destination);
+        destinationExists = true;
+      } catch (_) {}
+      if (destinationExists && !overwrite) {
+        throw FileSystemException('A file with the same name already exists.');
+      }
+      final backup = '$destination.jet2drop-backup-${uniqueSuffix()}';
+      if (destinationExists) await sftp.rename(destination, backup);
+      try {
+        await _withOperationTimeout(
+          sftp.rename(temporary, destination),
+          'Publishing upload',
+        );
+      } catch (_) {
+        if (destinationExists) {
+          try {
+            await sftp.rename(backup, destination);
+          } catch (_) {}
+        }
+        rethrow;
+      }
+      if (destinationExists) {
+        try {
+          await sftp.remove(backup);
+        } catch (_) {
+          // The destination is already safely published. Maintenance can
+          // remove an orphaned backup later.
+        }
+      }
+    } catch (exception) {
       try {
         await _withOperationTimeout(handle.close(), 'Closing failed upload');
       } catch (_) {}
-      try {
-        await _withOperationTimeout(
-          sftp.remove(temporary),
-          'Cleaning failed upload',
-        );
-      } catch (_) {}
+      if (resumeId == null ||
+          exception is TransferCancelled ||
+          control?.isCancelled == true) {
+        try {
+          await _withOperationTimeout(
+            sftp.remove(temporary),
+            'Cleaning failed upload',
+          );
+        } catch (_) {}
+      }
       rethrow;
+    }
+  }
+
+  @override
+  Future<void> discardUploadPartial({
+    required String targetDirectory,
+    required String targetName,
+    required String resumeId,
+  }) async {
+    final cleanName = normalizeRelativePath(targetName);
+    final safeResumeId = resumeId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final destination = _remote(joinRelativePath(targetDirectory, cleanName));
+    try {
+      await (await _connection).remove(
+        '$destination.jet2drop-upload-$safeResumeId.part',
+      );
+    } catch (_) {
+      // A completed or never-started task has no partial file to discard.
     }
   }
 
@@ -231,6 +384,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
   Future<void> downloadFile({
     required String remotePath,
     required File target,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   }) async {
@@ -239,14 +393,36 @@ class SftpRepositoryGateway implements RepositoryGateway {
     final remote = _remote(remotePath);
     final stat = await sftp.stat(remote);
     final total = stat.size ?? 0;
+    final safeResumeId = resumeId == null
+        ? uniqueSuffix()
+        : resumeId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
     final temporary = File(
-      '${target.path}.jet2drop-download-${uniqueSuffix()}.part',
+      '${target.path}.jet2drop-download-$safeResumeId.part',
     );
-    final sink = temporary.openWrite();
+    var written = resumeId != null && await temporary.exists()
+        ? await temporary.length()
+        : 0;
+    if (written > total) {
+      await temporary.delete();
+      written = 0;
+    }
+    final sink = temporary.openWrite(
+      mode: written == 0 ? FileMode.write : FileMode.append,
+    );
     final handle = await sftp.open(remote, mode: SftpFileOpenMode.read);
-    var written = 0;
     try {
-      await for (final chunk in handle.read()) {
+      onProgress?.call(written, total);
+      await for (final chunk
+          in handle
+              .read(offset: written)
+              .timeout(
+                _operationTimeout,
+                onTimeout: (sink) => sink.addError(
+                  TimeoutException(
+                    'Downloading file made no progress for ${_operationTimeout.inSeconds} seconds.',
+                  ),
+                ),
+              )) {
         await control?.checkpoint();
         sink.add(chunk);
         written += chunk.length;
@@ -256,22 +432,48 @@ class SftpRepositoryGateway implements RepositoryGateway {
       await sink.close();
       await handle.close();
       await control?.checkpoint();
-      if (await target.exists()) await target.delete();
-      await temporary.rename(target.path);
-    } catch (_) {
+      final backup = File('${target.path}.jet2drop-backup-${uniqueSuffix()}');
+      final hadTarget = await target.exists();
+      if (hadTarget) await target.rename(backup.path);
+      try {
+        await temporary.rename(target.path);
+      } catch (_) {
+        if (hadTarget && await backup.exists()) {
+          await backup.rename(target.path);
+        }
+        rethrow;
+      }
+      if (hadTarget && await backup.exists()) {
+        try {
+          await backup.delete();
+        } catch (_) {}
+      }
+    } catch (exception) {
       await sink.close();
       await handle.close();
-      if (await temporary.exists()) await temporary.delete();
+      if ((resumeId == null ||
+              exception is TransferCancelled ||
+              control?.isCancelled == true) &&
+          await temporary.exists()) {
+        await temporary.delete();
+      }
       rethrow;
     }
   }
 
   @override
-  Future<File> materializeForPreview(String relativePath) async {
+  Future<File> materializeForPreview(
+    String relativePath, {
+    TransferControl? control,
+  }) async {
     final target = File(
       '${cacheDirectory.path}${Platform.pathSeparator}${uniqueSuffix()}',
     );
-    await downloadFile(remotePath: relativePath, target: target);
+    await downloadFile(
+      remotePath: relativePath,
+      target: target,
+      control: control,
+    );
     return target;
   }
 

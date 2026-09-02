@@ -4,9 +4,14 @@ class TransferCancelled implements Exception {
   const TransferCancelled();
 }
 
+class TransferDeferred implements Exception {
+  const TransferDeferred();
+}
+
 class TransferControl {
   bool _paused = false;
   bool _cancelled = false;
+  bool _deferred = false;
   Completer<void>? _resumeCompleter;
   void Function()? _onPause;
   void Function()? _onResume;
@@ -14,6 +19,7 @@ class TransferControl {
 
   bool get isPaused => _paused;
   bool get isCancelled => _cancelled;
+  bool get isDeferred => _deferred;
 
   void bind({
     void Function()? onPause,
@@ -49,11 +55,23 @@ class TransferControl {
     await _onCancel?.call();
   }
 
+  /// Stops the current I/O without discarding its resumable partial file.
+  Future<void> defer() async {
+    if (_cancelled || _deferred) return;
+    _deferred = true;
+    _paused = false;
+    _resumeCompleter?.complete();
+    _resumeCompleter = null;
+    await _onCancel?.call();
+  }
+
   Future<void> checkpoint() async {
     if (_cancelled) throw const TransferCancelled();
+    if (_deferred) throw const TransferDeferred();
     while (_paused) {
       await _resumeCompleter!.future;
       if (_cancelled) throw const TransferCancelled();
+      if (_deferred) throw const TransferDeferred();
     }
   }
 }

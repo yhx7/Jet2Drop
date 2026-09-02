@@ -1,8 +1,13 @@
 package com.jet2drop.app
 
 import android.app.Activity
+import android.Manifest
 import android.content.Intent
+import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.content.ContentValues
@@ -18,6 +23,7 @@ class MainActivity : FlutterActivity() {
     private val channelName = "jet2drop/save_document"
     private val mediaPickerChannelName = "jet2drop/media_picker"
     private val tailscaleChannelName = "jet2drop/tailscale"
+    private val transferServiceChannelName = "jet2drop/transfer_service"
     private val createDocumentRequestCode = 41002
     private val pickMediaRequestCode = 41003
     private var pendingSourcePath: String? = null
@@ -54,7 +60,16 @@ class MainActivity : FlutterActivity() {
         val targetCallback = pendingTargetResult
         if (targetCallback != null) {
             pendingTargetResult = null
-            targetCallback.success(if (resultCode == Activity.RESULT_OK) data?.data?.toString() else null)
+            val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+            if (uri != null) {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                    )
+                }
+            }
+            targetCallback.success(uri?.toString())
             return
         }
         val sourcePath = pendingSourcePath
@@ -91,6 +106,10 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        cacheDir.listFiles()
+            ?.filter { it.name.startsWith("quick-media-") &&
+                System.currentTimeMillis() - it.lastModified() > 24 * 60 * 60 * 1000L }
+            ?.forEach { runCatching { it.delete() } }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
                 if (call.method == "saveMedia") {
@@ -143,6 +162,9 @@ class MainActivity : FlutterActivity() {
                     pendingTargetResult = result
                     startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                        addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
                         type = call.argument<String>("mimeType") ?: "application/octet-stream"
                         putExtra(Intent.EXTRA_TITLE, call.argument<String>("suggestedName") ?: "download")
                     }, createDocumentRequestCode)
@@ -190,6 +212,21 @@ class MainActivity : FlutterActivity() {
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, mediaPickerChannelName)
             .setMethodCallHandler { call, result ->
+                if (call.method == "cleanupPickedMedia") {
+                    val cachePath = cacheDir.canonicalPath + File.separator
+                    val paths = call.argument<List<String>>("paths") ?: emptyList()
+                    paths.forEach { path ->
+                        runCatching {
+                            val candidate = File(path)
+                            if (candidate.canonicalPath.startsWith(cachePath) &&
+                                candidate.name.startsWith("quick-media-")) {
+                                candidate.delete()
+                            }
+                        }
+                    }
+                    result.success(true)
+                    return@setMethodCallHandler
+                }
                 if (call.method != "pickImagesAndVideos") {
                     result.notImplemented()
                     return@setMethodCallHandler
@@ -199,14 +236,30 @@ class MainActivity : FlutterActivity() {
                     return@setMethodCallHandler
                 }
                 pendingMediaResult = result
-                startActivityForResult(Intent(Intent.ACTION_PICK).apply {
-                    setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
+                val pickerIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
                     putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                     putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
-                }, pickMediaRequestCode)
+                }
+                startActivityForResult(pickerIntent, pickMediaRequestCode)
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, tailscaleChannelName)
             .setMethodCallHandler { call, result ->
+                if (call.method == "isTailscaleActive") {
+                    val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                    val tailscaleUid = runCatching {
+                        packageManager.getApplicationInfo("com.tailscale.ipn", 0).uid
+                    }.getOrNull()
+                    val tailscaleActive = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        tailscaleUid != null && connectivity.allNetworks.any { network ->
+                            val capabilities = connectivity.getNetworkCapabilities(network)
+                            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
+                                capabilities.ownerUid == tailscaleUid
+                    }
+                    result.success(tailscaleActive)
+                    return@setMethodCallHandler
+                }
                 if (call.method != "openTailscale") {
                     result.notImplemented()
                     return@setMethodCallHandler
@@ -221,6 +274,39 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 } catch (_: Exception) {
                     result.success(false)
+                }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, transferServiceChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "start", "update" -> {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 41004)
+                        }
+                        val intent = Intent(this, TransferForegroundService::class.java).apply {
+                            action = if (call.method == "start") {
+                                TransferForegroundService.ACTION_START
+                            } else {
+                                TransferForegroundService.ACTION_UPDATE
+                            }
+                            putExtra(TransferForegroundService.EXTRA_CURRENT, call.argument<Int>("current") ?: 0)
+                            putExtra(TransferForegroundService.EXTRA_TOTAL, call.argument<Int>("total") ?: 0)
+                            putExtra(TransferForegroundService.EXTRA_TASKS, call.argument<Int>("tasks") ?: 1)
+                        }
+                        if (call.method == "start" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(true)
+                    }
+                    "stop" -> {
+                        stopService(Intent(this, TransferForegroundService::class.java))
+                        result.success(true)
+                    }
+                    else -> result.notImplemented()
                 }
             }
     }

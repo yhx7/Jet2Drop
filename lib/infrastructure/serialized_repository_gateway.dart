@@ -21,6 +21,14 @@ class SerializedRepositoryGateway implements RepositoryGateway {
   Future<void> initialize() => _run(_delegate.initialize);
 
   @override
+  Future<int?> availableBytes(String relativePath) =>
+      _run(() => _delegate.availableBytes(relativePath));
+
+  @override
+  Future<void> recoverTemporaryFiles(String relativePath) =>
+      _run(() => _delegate.recoverTemporaryFiles(relativePath));
+
+  @override
   Future<List<FileEntry>> listDirectory(String relativePath) =>
       _run(() => _delegate.listDirectory(relativePath));
 
@@ -38,6 +46,7 @@ class SerializedRepositoryGateway implements RepositoryGateway {
     required String targetDirectory,
     required String targetName,
     required bool overwrite,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   }) => _run(
@@ -46,8 +55,22 @@ class SerializedRepositoryGateway implements RepositoryGateway {
       targetDirectory: targetDirectory,
       targetName: targetName,
       overwrite: overwrite,
+      resumeId: resumeId,
       onProgress: onProgress,
       control: control,
+    ),
+  );
+
+  @override
+  Future<void> discardUploadPartial({
+    required String targetDirectory,
+    required String targetName,
+    required String resumeId,
+  }) => _run(
+    () => _delegate.discardUploadPartial(
+      targetDirectory: targetDirectory,
+      targetName: targetName,
+      resumeId: resumeId,
     ),
   );
 
@@ -55,20 +78,26 @@ class SerializedRepositoryGateway implements RepositoryGateway {
   Future<void> downloadFile({
     required String remotePath,
     required File target,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   }) => _run(
     () => _delegate.downloadFile(
       remotePath: remotePath,
       target: target,
+      resumeId: resumeId,
       onProgress: onProgress,
       control: control,
     ),
   );
 
   @override
-  Future<File> materializeForPreview(String relativePath) =>
-      _run(() => _delegate.materializeForPreview(relativePath));
+  Future<File> materializeForPreview(
+    String relativePath, {
+    TransferControl? control,
+  }) => _run(
+    () => _delegate.materializeForPreview(relativePath, control: control),
+  );
 
   @override
   Future<void> dispose() => _run(_delegate.dispose);

@@ -7,6 +7,11 @@ class TailscaleBridge {
 
   static const _channel = MethodChannel('jet2drop/tailscale');
 
+  static Future<bool> isActive() async {
+    if (!Platform.isAndroid) return false;
+    return await _channel.invokeMethod<bool>('isTailscaleActive') ?? false;
+  }
+
   static Future<bool> open() async {
     if (Platform.isAndroid) {
       return await _channel.invokeMethod<bool>('openTailscale') ?? false;

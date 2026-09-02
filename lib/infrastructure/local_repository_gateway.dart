@@ -16,6 +16,38 @@ class LocalRepositoryGateway implements RepositoryGateway {
   @override
   Future<void> initialize() => _root.create(recursive: true);
 
+  @override
+  Future<int?> availableBytes(String relativePath) async => null;
+
+  @override
+  Future<void> recoverTemporaryFiles(String relativePath) async {
+    final directory = _directoryFor(relativePath);
+    if (!await directory.exists()) return;
+    final cutoff = DateTime.now().subtract(const Duration(days: 7));
+    await for (final entity in directory.list(followLinks: false)) {
+      if (entity is! File) continue;
+      final name = entity.path.split(Platform.pathSeparator).last;
+      final backupIndex = name.indexOf('.jet2drop-backup-');
+      if (backupIndex >= 0) {
+        final original = File(
+          '${directory.path}${Platform.pathSeparator}${name.substring(0, backupIndex)}',
+        );
+        if (!await original.exists()) {
+          await entity.rename(original.path);
+        } else if ((await entity.stat()).modified.isBefore(cutoff)) {
+          await entity.delete();
+        }
+        continue;
+      }
+      if ((name.contains('.jet2drop-upload-') ||
+              name.contains('.jet2drop-download-')) &&
+          name.endsWith('.part') &&
+          (await entity.stat()).modified.isBefore(cutoff)) {
+        await entity.delete();
+      }
+    }
+  }
+
   FileSystemEntity _entityFor(String relativePath) {
     final safePath = normalizeRelativePath(relativePath);
     return File(
@@ -45,7 +77,10 @@ class LocalRepositoryGateway implements RepositoryGateway {
       final name = entity.path.split(Platform.pathSeparator).last;
       if (name == '.jet2drop-history' ||
           name == '__jet2drop_transfer' ||
-          name.startsWith('.jet2drop-')) {
+          name.startsWith('.jet2drop-') ||
+          name.contains('.jet2drop-upload-') ||
+          name.contains('.jet2drop-download-') ||
+          name.contains('.jet2drop-backup-')) {
         continue;
       }
       final stat = await entity.stat();
@@ -107,6 +142,7 @@ class LocalRepositoryGateway implements RepositoryGateway {
     required String targetDirectory,
     required String targetName,
     required bool overwrite,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   }) async {
@@ -125,14 +161,24 @@ class LocalRepositoryGateway implements RepositoryGateway {
         destination.path,
       );
     }
-    final temp = File(
-      '${destination.path}.jet2drop-upload-${uniqueSuffix()}.part',
-    );
+    final safeResumeId = resumeId == null
+        ? uniqueSuffix()
+        : resumeId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final temp = File('${destination.path}.jet2drop-upload-$safeResumeId.part');
     final total = await source.length();
-    var written = 0;
-    final sink = temp.openWrite();
+    var written = resumeId != null && await temp.exists()
+        ? await temp.length()
+        : 0;
+    if (written > total) {
+      await temp.delete();
+      written = 0;
+    }
+    final sink = temp.openWrite(
+      mode: written == 0 ? FileMode.write : FileMode.append,
+    );
     try {
-      await for (final chunk in source.openRead()) {
+      onProgress?.call(written, total);
+      await for (final chunk in source.openRead(written)) {
         await control?.checkpoint();
         sink.add(chunk);
         written += chunk.length;
@@ -140,21 +186,59 @@ class LocalRepositoryGateway implements RepositoryGateway {
       }
       await sink.flush();
       await sink.close();
-      if (await destination.exists()) {
-        await destination.delete();
+      final backup = File(
+        '${destination.path}.jet2drop-backup-${uniqueSuffix()}',
+      );
+      final hadDestination = await destination.exists();
+      if (hadDestination) await destination.rename(backup.path);
+      try {
+        await temp.rename(destination.path);
+      } catch (_) {
+        if (hadDestination && await backup.exists()) {
+          await backup.rename(destination.path);
+        }
+        rethrow;
       }
-      await temp.rename(destination.path);
-    } catch (_) {
+      // Publishing has succeeded. A stale backup is harmless and is cleaned by
+      // maintenance; failing to delete it must not turn a successful upload
+      // into a failed task or roll the new file back.
+      if (hadDestination && await backup.exists()) {
+        try {
+          await backup.delete();
+        } catch (_) {}
+      }
+    } catch (exception) {
       await sink.close();
-      if (await temp.exists()) await temp.delete();
+      if ((resumeId == null ||
+              exception is TransferCancelled ||
+              control?.isCancelled == true) &&
+          await temp.exists()) {
+        await temp.delete();
+      }
       rethrow;
     }
+  }
+
+  @override
+  Future<void> discardUploadPartial({
+    required String targetDirectory,
+    required String targetName,
+    required String resumeId,
+  }) async {
+    final directory = _directoryFor(targetDirectory);
+    final cleanName = normalizeRelativePath(targetName);
+    final safeResumeId = resumeId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final partial = File(
+      '${directory.path}${Platform.pathSeparator}$cleanName.jet2drop-upload-$safeResumeId.part',
+    );
+    if (await partial.exists()) await partial.delete();
   }
 
   @override
   Future<void> downloadFile({
     required String remotePath,
     required File target,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   }) async {
@@ -163,14 +247,24 @@ class LocalRepositoryGateway implements RepositoryGateway {
       throw FileSystemException('File not found.', source.path);
     }
     await target.parent.create(recursive: true);
-    final temp = File(
-      '${target.path}.jet2drop-download-${uniqueSuffix()}.part',
-    );
+    final safeResumeId = resumeId == null
+        ? uniqueSuffix()
+        : resumeId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final temp = File('${target.path}.jet2drop-download-$safeResumeId.part');
     final total = await source.length();
-    var written = 0;
-    final sink = temp.openWrite();
+    var written = resumeId != null && await temp.exists()
+        ? await temp.length()
+        : 0;
+    if (written > total) {
+      await temp.delete();
+      written = 0;
+    }
+    final sink = temp.openWrite(
+      mode: written == 0 ? FileMode.write : FileMode.append,
+    );
     try {
-      await for (final chunk in source.openRead()) {
+      onProgress?.call(written, total);
+      await for (final chunk in source.openRead(written)) {
         await control?.checkpoint();
         sink.add(chunk);
         written += chunk.length;
@@ -178,20 +272,42 @@ class LocalRepositoryGateway implements RepositoryGateway {
       }
       await sink.flush();
       await sink.close();
-      if (await target.exists()) {
-        await target.delete();
+      final backup = File('${target.path}.jet2drop-backup-${uniqueSuffix()}');
+      final hadTarget = await target.exists();
+      if (hadTarget) await target.rename(backup.path);
+      try {
+        await temp.rename(target.path);
+      } catch (_) {
+        if (hadTarget && await backup.exists()) {
+          await backup.rename(target.path);
+        }
+        rethrow;
       }
-      await temp.rename(target.path);
-    } catch (_) {
+      if (hadTarget && await backup.exists()) {
+        try {
+          await backup.delete();
+        } catch (_) {}
+      }
+    } catch (exception) {
       await sink.close();
-      if (await temp.exists()) await temp.delete();
+      if ((resumeId == null ||
+              exception is TransferCancelled ||
+              control?.isCancelled == true) &&
+          await temp.exists()) {
+        await temp.delete();
+      }
       rethrow;
     }
   }
 
   @override
-  Future<File> materializeForPreview(String relativePath) async =>
-      File(_entityFor(relativePath).path);
+  Future<File> materializeForPreview(
+    String relativePath, {
+    TransferControl? control,
+  }) async {
+    await control?.checkpoint();
+    return File(_entityFor(relativePath).path);
+  }
 
   @override
   Future<void> dispose() async {}

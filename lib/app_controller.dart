@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'core/models/file_entry.dart';
 import 'core/models/transfer_task.dart';
 import 'core/models/quick_device.dart';
+import 'core/connection_retry.dart';
 import 'core/path_utils.dart';
 import 'core/repository_gateway.dart';
 import 'core/transfer_control.dart';
@@ -18,8 +19,20 @@ import 'infrastructure/local_repository_gateway.dart';
 import 'infrastructure/serialized_repository_gateway.dart';
 import 'infrastructure/sftp_repository_gateway.dart';
 import 'core/quick_transfer.dart';
+import 'platform/android_transfer_service.dart';
+import 'platform/android_save_file.dart';
+import 'platform/windows_lifecycle_bridge.dart';
 
 enum RepositoryMode { local, sftp }
+
+enum RepositoryConnectionStatus {
+  disconnected,
+  connecting,
+  connected,
+  retrying,
+}
+
+enum FileSortField { name, type, size, modifiedAt }
 
 class AppController extends ChangeNotifier {
   static const _modeKey = 'repository_mode';
@@ -29,8 +42,11 @@ class AppController extends ChangeNotifier {
   static const _usernameKey = 'sftp_username';
   static const _fingerprintKey = 'sftp_fingerprint';
   static const _passwordKey = 'sftp_password';
+  static const _sortFieldKey = 'file_sort_field';
+  static const _sortAscendingKey = 'file_sort_ascending';
   static const _deviceIdKey = 'quick_device_id';
   static const _deviceNameKey = 'quick_device_name';
+  static const _pendingTransfersKey = 'pending_transfers_v1';
   static const _quickRoot = '__jet2drop_transfer';
   static const _quickMessages = 'messages';
 
@@ -42,30 +58,99 @@ class AppController extends ChangeNotifier {
   bool isInitializing = true;
   bool isLoading = false;
   bool _isRefreshingRepository = false;
+  bool _repositoryRefreshPending = false;
   bool isDarkTheme = false;
   bool needsTailscale = false;
+  RepositoryConnectionStatus connectionStatus =
+      RepositoryConnectionStatus.disconnected;
+  FileSortField sortField = FileSortField.name;
+  bool sortAscending = true;
   String? quickError;
   String currentPath = '';
   String? error;
   List<FileEntry> entries = const [];
   final List<TransferTask> tasks = [];
   final Map<String, TransferControl> _transferControls = {};
+  final Map<String, Future<void> Function(TransferTask)> _retryActions = {};
+  final Map<String, Future<void> Function()> _cleanupActions = {};
+  final Map<String, Future<void> Function()> _completionCleanupActions = {};
+  final Map<String, Map<String, Object?>> _pendingTransferRecords = {};
+  Future<void> _pendingWriteTail = Future<void>.value();
+  final Map<String, Completer<void>> _taskSettled = {};
+  final List<_QueuedQuickTransfer> _quickSendQueue = [];
+  final Map<String, _QueuedQuickTransfer> _pausedQuickTransfers = {};
+  final Set<String> _resumeAfterYield = {};
+  final Set<String> _quickLocallySaved = {};
+  bool _isProcessingQuickSendQueue = false;
+  bool _foregroundTransferActive = false;
+  DateTime? _lastForegroundUpdate;
+  DateTime? _lastTransferUiUpdate;
+  Timer? _transferUiTimer;
   final QuickTransferService quickTransfer = QuickTransferService();
   int _quickRefreshGeneration = 0;
   bool _isRefreshingQuickTransfer = false;
+  bool _quickRefreshPending = false;
+  Completer<void>? _quickRefreshIdle;
   Timer? _quickMaintenanceTimer;
   DateTime? _lastQuickDeviceRefresh;
+  final Map<String, QuickTransferManifest> _quickManifestCache = {};
+  final Map<String, ({DateTime modifiedAt, QuickDevice device})>
+  _quickDeviceCache = {};
   String deviceId = '';
   String deviceName = '';
   List<QuickDevice> quickDevices = const [];
   List<QuickTransferManifest> quickInbox = const [];
 
+  static const int maxTransferFiles = 100;
+  static const int maxTransferBytes = 10 * 1024 * 1024 * 1024;
+
+  bool get hasActiveTransfers =>
+      _transferControls.isNotEmpty ||
+      _quickSendQueue.isNotEmpty ||
+      _pausedQuickTransfers.isNotEmpty ||
+      tasks.any((task) => task.isPaused) ||
+      _isProcessingQuickSendQueue;
+
+  bool get hasRunningTransfers =>
+      _transferControls.isNotEmpty ||
+      _quickSendQueue.isNotEmpty ||
+      _isProcessingQuickSendQueue;
+
+  List<FileEntry> get sortedEntries {
+    final result = entries.toList(growable: false);
+    result.sort((left, right) {
+      if (left.type != right.type) return left.isDirectory ? -1 : 1;
+      final comparison = switch (sortField) {
+        FileSortField.name => left.name.toLowerCase().compareTo(
+          right.name.toLowerCase(),
+        ),
+        FileSortField.type => _fileExtension(
+          left.name,
+        ).compareTo(_fileExtension(right.name)),
+        FileSortField.size => left.size.compareTo(right.size),
+        FileSortField.modifiedAt => left.modifiedAt.compareTo(right.modifiedAt),
+      };
+      final resolved = comparison == 0
+          ? left.name.toLowerCase().compareTo(right.name.toLowerCase())
+          : comparison;
+      return sortAscending ? resolved : -resolved;
+    });
+    return result;
+  }
+
   List<QuickDevice> get quickRecipients => quickDevices
-      .where((device) => device.id != deviceId)
+      .where(
+        (device) =>
+            device.id != deviceId &&
+            DateTime.now().difference(device.updatedAt) <
+                const Duration(minutes: 2),
+      )
       .toList(growable: false);
 
   bool canClaimQuickTransfer(QuickTransferManifest manifest) =>
       !manifest.isClaimed && manifest.targetDevice == deviceId;
+
+  bool canRetryTask(TransferTask task) => _retryActions.containsKey(task.id);
 
   String quickDeviceName(String id) {
     if (id == deviceId) return deviceName;
@@ -88,6 +173,10 @@ class AppController extends ChangeNotifier {
     try {
       _preferences = await SharedPreferences.getInstance();
       isDarkTheme = _preferences.getBool('dark_theme') ?? false;
+      sortField = FileSortField.values.byName(
+        _preferences.getString(_sortFieldKey) ?? FileSortField.name.name,
+      );
+      sortAscending = _preferences.getBool(_sortAscendingKey) ?? true;
       localRoot = _preferences.getString(_rootKey) ?? r'E:\Repository';
       mode = RepositoryMode.values.byName(
         _preferences.getString(_modeKey) ??
@@ -95,8 +184,9 @@ class AppController extends ChangeNotifier {
                 ? RepositoryMode.local.name
                 : RepositoryMode.sftp.name),
       );
-      await _loadSftpProfile();
+      if (mode == RepositoryMode.sftp) await _loadSftpProfile();
       await connect();
+      await _restorePendingTransfers();
     } catch (exception) {
       error = describeError(exception);
       isReady = false;
@@ -104,6 +194,239 @@ class AppController extends ChangeNotifier {
       isInitializing = false;
       notifyListeners();
     }
+  }
+
+  Future<void> _restorePendingTransfers() async {
+    final raw = _preferences.getString(_pendingTransfersKey);
+    if (raw == null || raw.isEmpty) return;
+    late final List<dynamic> values;
+    try {
+      values = jsonDecode(raw) as List<dynamic>;
+    } catch (_) {
+      await _preferences.remove(_pendingTransfersKey);
+      return;
+    }
+    var recordsChanged = false;
+    for (final value in values) {
+      String? recordId;
+      try {
+        final record = Map<String, Object?>.from(value as Map);
+        final id = record['id'] as String;
+        recordId = id;
+        final kind = record['kind'] as String;
+        _pendingTransferRecords[id] = record;
+        if (kind == 'download') {
+          final target = File(record['targetPath'] as String);
+          final targetUri = record['androidTargetUri'] as String?;
+          final entry = FileEntry(
+            path: record['remotePath'] as String,
+            name: record['name'] as String,
+            type: FileEntryType.file,
+            size: (record['totalBytes'] as num).toInt(),
+            modifiedAt: DateTime.parse(record['modifiedAt'] as String),
+          );
+          final task = TransferTask(
+            id: id,
+            name: entry.name,
+            direction: TransferDirection.download,
+            totalBytes: entry.size,
+            status: TransferStatus.failed,
+            error: '上次下载尚未完成，可以继续重试。',
+          );
+          tasks.add(task);
+          Future<void> finalizer(File file) async {
+            if (targetUri == null) return;
+            final saved = await AndroidSaveFile.saveToDocumentTarget(
+              source: file,
+              targetUri: targetUri,
+            );
+            if (!saved) throw StateError('Final save failed.');
+            if (await file.exists()) await file.delete();
+          }
+
+          _retryActions[id] = (retryTask) => _runDownloadTask(
+            retryTask,
+            entry: entry,
+            target: target,
+            finalize: targetUri == null ? null : finalizer,
+          );
+          _cleanupActions[id] = () async {
+            final partial = File('${target.path}.jet2drop-download-$id.part');
+            if (await partial.exists()) await partial.delete();
+            if (record['deleteTargetOnCancel'] == true &&
+                await target.exists()) {
+              await target.delete();
+            }
+          };
+          continue;
+        }
+        if (kind == 'quickReceive') {
+          final manifest = QuickTransferManifest.fromJson(
+            Map<String, dynamic>.from(record['manifest'] as Map),
+          );
+          final target = File(record['targetPath'] as String);
+          final targetUri = record['androidTargetUri'] as String?;
+          final saveAsMedia = record['saveAsMedia'] as bool? ?? false;
+          final mimeType =
+              record['mimeType'] as String? ?? 'application/octet-stream';
+          final task = TransferTask(
+            id: id,
+            name: manifest.name,
+            direction: TransferDirection.quickReceive,
+            totalBytes: manifest.size,
+            status: TransferStatus.failed,
+            error: record['locallySaved'] == true
+                ? '文件已经保存，领取状态尚未同步，可点击重试。'
+                : '上次领取尚未完成，可以继续重试。',
+          );
+          tasks.add(task);
+          if (record['locallySaved'] == true) _quickLocallySaved.add(id);
+          final saver = Platform.isAndroid
+              ? (File file) => _saveAndroidQuickTarget(
+                  file,
+                  manifest: manifest,
+                  targetUri: targetUri,
+                  saveAsMedia: saveAsMedia,
+                  mimeType: mimeType,
+                )
+              : null;
+          _retryActions[id] = (retryTask) => _runQuickReceiveTask(
+            retryTask,
+            manifest: manifest,
+            target: target,
+            finalize: true,
+            saveTarget: saver,
+          );
+          _cleanupActions[id] = () async {
+            final support = await getApplicationSupportDirectory();
+            final staging = Directory(
+              '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
+            );
+            if (await staging.exists()) await staging.delete(recursive: true);
+            if (Platform.isAndroid && await target.exists()) {
+              await target.delete();
+            }
+          };
+          continue;
+        }
+        final source = File(record['sourcePath'] as String);
+        final task = TransferTask(
+          id: id,
+          name: record['name'] as String,
+          direction: kind == 'quick'
+              ? TransferDirection.quickSend
+              : TransferDirection.upload,
+          totalBytes: (record['totalBytes'] as num).toInt(),
+          status: TransferStatus.failed,
+          error: await source.exists() ? '上次传输未完成，可以继续重试。' : '原文件已不存在，无法继续传输。',
+        );
+        tasks.add(task);
+        if (!await source.exists()) continue;
+        if (kind == 'quick') {
+          final targetDevice = record['targetDevice'] as String;
+          _retryActions[id] = (retryTask) async {
+            final queued = _QueuedQuickTransfer(
+              source: source,
+              targetDevice: targetDevice,
+              task: retryTask,
+            );
+            _quickSendQueue.add(queued);
+            _syncForegroundTransfer(force: true);
+            notifyListeners();
+            unawaited(_processQuickSendQueue());
+            await queued.completer.future;
+          };
+          _cleanupActions[id] = () async {
+            try {
+              await _gateway!.deleteEntry(
+                '$_quickRoot/$_quickMessages/$id',
+                recursive: true,
+              );
+            } catch (_) {}
+            if (record['ownedSource'] == true && await source.exists()) {
+              await source.delete();
+            }
+          };
+          if (record['ownedSource'] == true) {
+            _completionCleanupActions[id] = () async {
+              if (await source.exists()) await source.delete();
+            };
+          }
+        } else {
+          final targetDirectory = record['targetDirectory'] as String;
+          final overwrite = record['overwrite'] as bool? ?? true;
+          _retryActions[id] = (retryTask) => _runUploadTask(
+            retryTask,
+            source: source,
+            targetDirectory: targetDirectory,
+            overwrite: overwrite,
+          );
+          _cleanupActions[id] = () async {
+            await _gateway!.discardUploadPartial(
+              targetDirectory: targetDirectory,
+              targetName: task.name,
+              resumeId: id,
+            );
+            if (record['ownedSource'] == true && await source.exists()) {
+              await source.delete();
+            }
+          };
+          if (record['ownedSource'] == true) {
+            _completionCleanupActions[id] = () async {
+              if (await source.exists()) await source.delete();
+            };
+          }
+        }
+      } catch (_) {
+        recordsChanged = true;
+        if (recordId != null) {
+          _pendingTransferRecords.remove(recordId);
+          tasks.removeWhere((task) => task.id == recordId);
+          _retryActions.remove(recordId);
+          _cleanupActions.remove(recordId);
+          _completionCleanupActions.remove(recordId);
+          _quickLocallySaved.remove(recordId);
+        }
+      }
+    }
+    if (recordsChanged) await _persistPendingTransfers();
+    notifyListeners();
+  }
+
+  Future<void> _rememberPending(Map<String, Object?> record) async {
+    _pendingTransferRecords[record['id']! as String] = record;
+    await _persistPendingTransfers();
+  }
+
+  Future<void> _forgetPending(String id) async {
+    if (_pendingTransferRecords.remove(id) != null) {
+      await _persistPendingTransfers();
+    }
+  }
+
+  Future<void> _persistPendingTransfers() {
+    final snapshot = jsonEncode(
+      _pendingTransferRecords.values.toList(growable: false),
+    );
+    final write = _pendingWriteTail.then((_) async {
+      await _preferences.setString(_pendingTransfersKey, snapshot);
+    });
+    _pendingWriteTail = write.catchError((_) {});
+    return write;
+  }
+
+  Future<_DurableSource> _prepareDurableSource(File source, String id) async {
+    if (!Platform.isAndroid) return _DurableSource(source, owned: false);
+    final support = await getApplicationSupportDirectory();
+    final directory = Directory(
+      '${support.path}${Platform.pathSeparator}pending-transfer-sources',
+    );
+    await directory.create(recursive: true);
+    final target = File(
+      '${directory.path}${Platform.pathSeparator}$id-${sanitizeTransferFileName(source.uri.pathSegments.last)}',
+    );
+    await source.copy(target.path);
+    return _DurableSource(target, owned: true);
   }
 
   Future<void> _loadSftpProfile() async {
@@ -127,27 +450,90 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> configureLocalRoot(String path) async {
-    localRoot = path;
-    mode = RepositoryMode.local;
-    await _preferences.setString(_rootKey, path);
-    await _preferences.setString(_modeKey, mode.name);
-    await connect();
+    if (hasActiveTransfers) {
+      throw StateError('Wait for active transfers before changing connection.');
+    }
+    final clean = path.trim();
+    if (clean.isEmpty) throw ArgumentError('Repository path is required.');
+    final candidate = LocalRepositoryGateway(clean);
+    await _activateCandidate(
+      candidate,
+      onCommit: () async {
+        localRoot = clean;
+        mode = RepositoryMode.local;
+        await _preferences.setString(_rootKey, clean);
+        await _preferences.setString(_modeKey, mode.name);
+      },
+    );
   }
 
   Future<void> configureSftp(SftpConnectionProfile profile) async {
-    sftpProfile = profile;
-    mode = RepositoryMode.sftp;
-    await _preferences.setString(_hostKey, profile.host);
-    await _preferences.setInt(_portKey, profile.port);
-    await _preferences.setString(_usernameKey, profile.username);
-    await _preferences.setString(_fingerprintKey, profile.hostKeyFingerprint);
-    await _preferences.setString(_modeKey, mode.name);
-    await _secureStorage.write(key: _passwordKey, value: profile.password);
-    await connect();
+    if (hasActiveTransfers) {
+      throw StateError('Wait for active transfers before changing connection.');
+    }
+    final support = await getApplicationSupportDirectory();
+    final candidate = SerializedRepositoryGateway(
+      SftpRepositoryGateway(
+        profile,
+        Directory('${support.path}${Platform.pathSeparator}preview-cache'),
+      ),
+    );
+    await _activateCandidate(
+      candidate,
+      onCommit: () async {
+        sftpProfile = profile;
+        mode = RepositoryMode.sftp;
+        await _preferences.setString(_hostKey, profile.host);
+        await _preferences.setInt(_portKey, profile.port);
+        await _preferences.setString(_usernameKey, profile.username);
+        await _preferences.setString(
+          _fingerprintKey,
+          profile.hostKeyFingerprint,
+        );
+        await _preferences.setString(_modeKey, mode.name);
+        await _secureStorage.write(key: _passwordKey, value: profile.password);
+      },
+    );
+  }
+
+  Future<void> _activateCandidate(
+    RepositoryGateway candidate, {
+    required Future<void> Function() onCommit,
+  }) async {
+    isLoading = true;
+    connectionStatus = RepositoryConnectionStatus.connecting;
+    notifyListeners();
+    try {
+      await candidate.initialize().timeout(const Duration(seconds: 15));
+      final candidateEntries = await candidate
+          .listDirectory('')
+          .timeout(const Duration(seconds: 15));
+      await onCommit();
+      final previous = _gateway;
+      _gateway = candidate;
+      currentPath = '';
+      entries = candidateEntries;
+      isReady = true;
+      needsTailscale = false;
+      error = null;
+      connectionStatus = RepositoryConnectionStatus.connected;
+      await previous?.dispose();
+      await _initializeQuickTransferSafely();
+    } catch (_) {
+      await candidate.dispose();
+      rethrow;
+    } finally {
+      isLoading = false;
+      notifyListeners();
+    }
   }
 
   Future<void> connect() async {
+    if (hasActiveTransfers) return;
     isLoading = true;
+    connectionStatus = isReady
+        ? RepositoryConnectionStatus.retrying
+        : RepositoryConnectionStatus.connecting;
     error = null;
     notifyListeners();
     try {
@@ -169,15 +555,18 @@ class AppController extends ChangeNotifier {
       }
       await _gateway!.initialize().timeout(const Duration(seconds: 15));
       currentPath = '';
-      await refresh();
+      entries = await _retryOperation(() => _gateway!.listDirectory(''));
+      unawaited(_recoverTemporaryFiles(''));
       isReady = true;
       needsTailscale = false;
-      unawaited(_initializeQuickTransferSafely());
+      connectionStatus = RepositoryConnectionStatus.connected;
+      await _initializeQuickTransferSafely();
     } catch (exception) {
       error = describeError(exception);
       needsTailscale = _isTailscaleConnectivityError(exception);
       entries = const [];
       isReady = false;
+      connectionStatus = RepositoryConnectionStatus.disconnected;
     } finally {
       isLoading = false;
       notifyListeners();
@@ -189,8 +578,8 @@ class AppController extends ChangeNotifier {
       await _initializeQuickTransfer();
       quickError = null;
       _quickMaintenanceTimer ??= Timer.periodic(
-        const Duration(minutes: 15),
-        (_) => unawaited(refreshQuickTransfer(refreshDevices: true)),
+        const Duration(seconds: 45),
+        (_) => unawaited(_maintainQuickPresence()),
       );
     } catch (exception) {
       quickError = describeError(exception);
@@ -198,19 +587,51 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  Future<void> _maintainQuickPresence() async {
+    if (!isReady || hasRunningTransfers) return;
+    try {
+      await _publishDeviceRegistration();
+      await refreshQuickTransfer(refreshDevices: true);
+    } catch (exception) {
+      quickError = describeError(exception);
+      notifyListeners();
+    }
+  }
+
+  Future<void> onAppResumed() async {
+    if (hasActiveTransfers || isLoading) return;
+    if (!isReady ||
+        connectionStatus == RepositoryConnectionStatus.disconnected) {
+      await connect();
+      return;
+    }
+    await refresh();
+    unawaited(_maintainQuickPresence());
+  }
+
   Future<void> refresh() async {
     final gateway = _gateway;
     if (gateway == null || _isRefreshingRepository) return;
-    if (_transferControls.isNotEmpty) return;
+    if (hasRunningTransfers) {
+      _repositoryRefreshPending = true;
+      return;
+    }
+    _repositoryRefreshPending = false;
     _isRefreshingRepository = true;
     isLoading = true;
     notifyListeners();
     try {
       entries = await _retryOperation(() => gateway.listDirectory(currentPath));
+      unawaited(_recoverTemporaryFiles(currentPath));
       error = null;
+      isReady = true;
+      needsTailscale = false;
+      connectionStatus = RepositoryConnectionStatus.connected;
     } catch (exception) {
       error = describeError(exception);
       needsTailscale = _isTailscaleConnectivityError(exception);
+      isReady = false;
+      connectionStatus = RepositoryConnectionStatus.disconnected;
     } finally {
       _isRefreshingRepository = false;
       isLoading = false;
@@ -283,6 +704,21 @@ class AppController extends ChangeNotifier {
         normalized.contains('transfer package')) {
       return '文件校验失败，未保存，请重新传输。';
     }
+    if (normalized.contains('at most 100 files')) {
+      return '一次最多选择 100 个文件，请分批传输。';
+    }
+    if (normalized.contains('cannot exceed 10 gb')) {
+      return '本次选择超过 10 GB，请分批传输。';
+    }
+    if (normalized.contains('enough free space')) {
+      return '目标设备空间不足，请清理空间后重试。';
+    }
+    if (normalized.contains('active transfers')) {
+      return '有任务正在传输，请完成或取消后再更改连接。';
+    }
+    if (normalized.startsWith('bad state: download failed:')) {
+      return message.substring('Bad state: Download failed:'.length).trim();
+    }
     if (exception is SocketException) {
       return '网络连接失败，请检查网络和 Tailscale 连接状态。';
     }
@@ -339,8 +775,15 @@ class AppController extends ChangeNotifier {
   Future<void> _ensureDirectory(String parent, String name) async {
     try {
       await _gateway!.createDirectory(parent, name);
-    } catch (_) {
-      // The directory normally already exists; the next read validates it.
+    } catch (exception, stackTrace) {
+      final expected = joinRelativePath(parent, name);
+      try {
+        // Listing the directory itself validates it even when its name is
+        // deliberately hidden from the parent repository view.
+        await _gateway!.listDirectory(expected);
+        return;
+      } catch (_) {}
+      Error.throwWithStackTrace(exception, stackTrace);
     }
   }
 
@@ -399,12 +842,19 @@ class AppController extends ChangeNotifier {
 
   Future<void> refreshQuickTransfer({bool refreshDevices = false}) async {
     final gateway = _gateway;
-    if (gateway == null ||
-        deviceId.isEmpty ||
-        _isRefreshingQuickTransfer ||
-        _transferControls.isNotEmpty) {
+    if (gateway == null || deviceId.isEmpty) {
       return;
     }
+    if (hasRunningTransfers) {
+      _quickRefreshPending = true;
+      return;
+    }
+    final idle = _quickRefreshIdle ??= Completer<void>();
+    if (_isRefreshingQuickTransfer) {
+      _quickRefreshPending = true;
+      return idle.future;
+    }
+    _quickRefreshPending = false;
     _isRefreshingQuickTransfer = true;
     final generation = ++_quickRefreshGeneration;
     try {
@@ -416,20 +866,40 @@ class AppController extends ChangeNotifier {
               const Duration(minutes: 1);
       if (shouldRefreshDevices) {
         final discovered = <QuickDevice>[];
+        final visibleDevicePaths = <String>{};
         try {
-          for (final entry in await gateway.listDirectory(
-            '$_quickRoot/devices',
+          for (final entry in await _retryOperation(
+            () => gateway.listDirectory('$_quickRoot/devices'),
           )) {
             if (entry.isDirectory || !entry.name.endsWith('.json')) continue;
+            visibleDevicePaths.add(entry.path);
             try {
-              discovered.add(
-                QuickDevice.fromJson(
-                  jsonDecode(await _readQuickText(entry.path))
-                      as Map<String, dynamic>,
-                ),
+              final cached = _quickDeviceCache[entry.path];
+              final device =
+                  cached != null && cached.modifiedAt == entry.modifiedAt
+                  ? cached.device
+                  : QuickDevice.fromJson(
+                      jsonDecode(await _readQuickText(entry.path))
+                          as Map<String, dynamic>,
+                    );
+              _quickDeviceCache[entry.path] = (
+                modifiedAt: entry.modifiedAt,
+                device: device,
               );
+              final age = DateTime.now().difference(device.updatedAt);
+              if (age < const Duration(hours: 24)) discovered.add(device);
+              if (age > const Duration(days: 7)) {
+                unawaited(
+                  gateway
+                      .deleteEntry(entry.path, recursive: false)
+                      .catchError((_) {}),
+                );
+              }
             } catch (_) {}
           }
+          _quickDeviceCache.removeWhere(
+            (path, _) => !visibleDevicePaths.contains(path),
+          );
         } catch (_) {
           // Device names are optional metadata. Continue loading messages.
         }
@@ -470,12 +940,18 @@ class AppController extends ChangeNotifier {
         }
         for (final manifestPath in manifestPaths) {
           try {
-            final content = await _readQuickText(
-              manifestPath,
-            ).timeout(const Duration(seconds: 10));
-            var value = QuickTransferManifest.fromJson(
-              jsonDecode(content) as Map<String, dynamic>,
-            );
+            final cached = _quickManifestCache[manifestPath];
+            var value =
+                cached ??
+                QuickTransferManifest.fromJson(
+                  jsonDecode(
+                        await _readQuickText(
+                          manifestPath,
+                        ).timeout(const Duration(seconds: 10)),
+                      )
+                      as Map<String, dynamic>,
+                );
+            _quickManifestCache[manifestPath] = value;
             final receiptPath = manifestPath.replaceFirst(
               '/manifest.json',
               '/receipt.json',
@@ -487,17 +963,21 @@ class AppController extends ChangeNotifier {
               value = QuickTransferManifest.fromJson(
                 jsonDecode(receipt) as Map<String, dynamic>,
               );
+              _quickManifestCache[manifestPath] = value;
             } catch (_) {
               // A receipt is optional until the target device saves the file.
             }
             if (value.expiresAt.isBefore(DateTime.now().toUtc())) {
-              await gateway.deleteEntry(
-                manifestPath.substring(
-                  0,
-                  manifestPath.length - '/manifest.json'.length,
+              await _retryOperation(
+                () => gateway.deleteEntry(
+                  manifestPath.substring(
+                    0,
+                    manifestPath.length - '/manifest.json'.length,
+                  ),
+                  recursive: true,
                 ),
-                recursive: true,
               );
+              _quickManifestCache.remove(manifestPath);
             } else if (value.senderDevice == deviceId ||
                 value.targetDevice == deviceId) {
               inbox.add(value);
@@ -506,21 +986,42 @@ class AppController extends ChangeNotifier {
             // An incomplete package is not published until its manifest exists.
           }
         }
-      } catch (_) {
-        // The message folder is created on demand by any connected device.
+        _quickManifestCache.removeWhere(
+          (path, _) => !manifestPaths.contains(path),
+        );
+      } catch (exception, stackTrace) {
         await _resetConnection();
+        Error.throwWithStackTrace(exception, stackTrace);
       }
       inbox.sort((left, right) => right.createdAt.compareTo(left.createdAt));
-      if (generation != _quickRefreshGeneration) return;
-      quickDevices = registered;
-      quickInbox = inbox;
-      notifyListeners();
+      if (generation == _quickRefreshGeneration &&
+          identical(gateway, _gateway)) {
+        quickDevices = registered;
+        quickInbox = inbox;
+        quickError = null;
+        notifyListeners();
+      } else {
+        _quickRefreshPending = true;
+      }
     } catch (exception) {
-      quickError = describeError(exception);
-      notifyListeners();
+      if (generation == _quickRefreshGeneration &&
+          identical(gateway, _gateway) &&
+          !hasRunningTransfers) {
+        quickError = describeError(exception);
+        notifyListeners();
+      } else {
+        _quickRefreshPending = true;
+      }
     } finally {
       _isRefreshingQuickTransfer = false;
+      if (_quickRefreshPending && !hasRunningTransfers) {
+        unawaited(refreshQuickTransfer(refreshDevices: refreshDevices));
+      } else if (!idle.isCompleted) {
+        idle.complete();
+        if (identical(_quickRefreshIdle, idle)) _quickRefreshIdle = null;
+      }
     }
+    await idle.future;
   }
 
   Future<void> open(FileEntry entry) async {
@@ -538,17 +1039,21 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> createDirectory(String name) async {
-    await _runSimple(
-      () => _retryOperation(() => _gateway!.createDirectory(currentPath, name)),
+    final safeName = sanitizeTransferFileName(name);
+    if (entries.any(
+      (entry) => entry.name.toLowerCase() == safeName.toLowerCase(),
+    )) {
+      throw FileSystemException('同名文件或文件夹已存在。', safeName);
+    }
+    await _retryOperation(
+      () => _gateway!.createDirectory(currentPath, safeName),
     );
     await refresh();
   }
 
   Future<void> deleteEntry(FileEntry entry) async {
-    await _runSimple(
-      () => _retryOperation(
-        () => _gateway!.deleteEntry(entry.path, recursive: entry.isDirectory),
-      ),
+    await _retryOperation(
+      () => _gateway!.deleteEntry(entry.path, recursive: entry.isDirectory),
     );
     await refresh();
   }
@@ -558,50 +1063,138 @@ class AppController extends ChangeNotifier {
     required bool overwrite,
     bool keepBoth = false,
   }) async {
+    await validateTransferSelection(files);
+    final reservedNames = entries
+        .map((entry) => entry.name.toLowerCase())
+        .toSet();
+    final selectedNames = <String>{};
+    final settledTasks = <Future<void>>[];
     for (final file in files) {
-      final sourceName = file.uri.pathSegments.last;
-      final targetName = keepBoth ? _availableName(sourceName) : sourceName;
+      final sourceName = sanitizeTransferFileName(file.uri.pathSegments.last);
+      final duplicateInBatch = !selectedNames.add(sourceName.toLowerCase());
+      final targetName = keepBoth || duplicateInBatch
+          ? _availableName(sourceName, reservedNames)
+          : sourceName;
+      reservedNames.add(targetName.toLowerCase());
+      final targetDirectory = currentPath;
+      final taskId = uniqueSuffix();
+      final durableSource = await _prepareDurableSource(file, taskId);
       final task = TransferTask(
-        id: uniqueSuffix(),
+        id: taskId,
         name: targetName,
         direction: TransferDirection.upload,
-        totalBytes: await file.length(),
+        totalBytes: await durableSource.file.length(),
         status: TransferStatus.running,
       );
       tasks.insert(0, task);
-      final control = TransferControl();
-      _transferControls[task.id] = control;
-      notifyListeners();
-      try {
-        await _retryOperation(
-          () => _gateway!.uploadFile(
-            source: file,
-            targetDirectory: currentPath,
-            targetName: task.name,
-            overwrite: overwrite,
-            onProgress: (current, _) {
-              task.transferredBytes = current;
-              notifyListeners();
-            },
-            control: control,
-          ),
-        );
-        task.status = TransferStatus.completed;
-      } catch (exception) {
-        if (!task.cancelRequested) {
-          task.status = TransferStatus.failed;
-          task.error = describeError(exception);
-        }
-      }
-      _transferControls.remove(task.id);
-      notifyListeners();
+      final settled = Completer<void>();
+      _taskSettled[task.id] = settled;
+      settledTasks.add(settled.future);
+      _retryActions[task.id] = (retryTask) => _runUploadTask(
+        retryTask,
+        source: durableSource.file,
+        targetDirectory: targetDirectory,
+        overwrite: overwrite,
+      );
+      _cleanupActions[task.id] = () => _gateway!
+          .discardUploadPartial(
+            targetDirectory: targetDirectory,
+            targetName: targetName,
+            resumeId: task.id,
+          )
+          .whenComplete(() => durableSource.deleteIfOwned());
+      _completionCleanupActions[task.id] = durableSource.deleteIfOwned;
+      await _rememberPending({
+        'kind': 'upload',
+        'id': task.id,
+        'sourcePath': durableSource.file.path,
+        'ownedSource': durableSource.owned,
+        'name': targetName,
+        'totalBytes': task.totalBytes,
+        'targetDirectory': targetDirectory,
+        'overwrite': overwrite,
+      });
+      await _retryActions[task.id]!(task);
       if (task.cancelRequested) break;
     }
+    await Future.wait(settledTasks);
     await refresh();
   }
 
-  String _availableName(String name) {
-    final names = entries.map((entry) => entry.name.toLowerCase()).toSet();
+  Future<void> _runUploadTask(
+    TransferTask task, {
+    required File source,
+    required String targetDirectory,
+    required bool overwrite,
+  }) async {
+    final control = TransferControl();
+    _transferControls[task.id] = control;
+    _syncForegroundTransfer(force: true);
+    task
+      ..status = TransferStatus.running
+      ..error = null
+      ..cancelRequested = false
+      ..isPaused = false;
+    notifyListeners();
+    var resumeAfterYield = false;
+    try {
+      if (!await source.exists()) {
+        throw FileSystemException('Selected file is unavailable.', source.path);
+      }
+      await _ensureRemoteSpace(await source.length(), targetDirectory);
+      await _retryOperation(
+        () => _gateway!.uploadFile(
+          source: source,
+          targetDirectory: targetDirectory,
+          targetName: task.name,
+          overwrite: overwrite,
+          resumeId: task.id,
+          onProgress: (current, _) {
+            task.transferredBytes = current;
+            _notifyTransferProgress();
+          },
+          control: control,
+        ),
+      );
+      task
+        ..transferredBytes = task.totalBytes
+        ..status = TransferStatus.completed;
+      _cleanupActions.remove(task.id);
+      await _runCompletionCleanup(task.id);
+      await _forgetPending(task.id);
+    } catch (exception) {
+      if (control.isDeferred && !task.cancelRequested) {
+        task.error = null;
+        if (_resumeAfterYield.remove(task.id)) {
+          task
+            ..isPaused = false
+            ..status = TransferStatus.queued;
+          resumeAfterYield = true;
+        }
+      } else if (!task.cancelRequested) {
+        task.status = TransferStatus.failed;
+        task.error = describeError(exception);
+      }
+    } finally {
+      if (identical(_transferControls[task.id], control)) {
+        _transferControls.remove(task.id);
+      }
+      _syncForegroundTransfer(force: true);
+      notifyListeners();
+      if (resumeAfterYield) {
+        final action = _retryActions[task.id];
+        if (action != null) unawaited(action(task));
+      }
+      if (task.status == TransferStatus.completed ||
+          task.status == TransferStatus.failed ||
+          task.status == TransferStatus.cancelled) {
+        final settled = _taskSettled.remove(task.id);
+        if (settled != null && !settled.isCompleted) settled.complete();
+      }
+    }
+  }
+
+  String _availableName(String name, Set<String> names) {
     if (!names.contains(name.toLowerCase())) return name;
     final dot = name.lastIndexOf('.');
     final stem = dot > 0 ? name.substring(0, dot) : name;
@@ -612,7 +1205,14 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> downloadFile(FileEntry entry, File target) async {
+  Future<void> downloadFile(
+    FileEntry entry,
+    File target, {
+    void Function(TransferTask task)? onTaskCreated,
+    Future<void> Function(File file)? finalize,
+    bool deleteTargetOnCancel = false,
+    String? androidTargetUri,
+  }) async {
     final task = TransferTask(
       id: uniqueSuffix(),
       name: entry.name,
@@ -621,22 +1221,87 @@ class AppController extends ChangeNotifier {
       status: TransferStatus.running,
     );
     tasks.insert(0, task);
+    onTaskCreated?.call(task);
+    final finalizer =
+        finalize ??
+        (androidTargetUri == null
+            ? null
+            : (File file) async {
+                final saved = await AndroidSaveFile.saveToDocumentTarget(
+                  source: file,
+                  targetUri: androidTargetUri,
+                );
+                if (!saved) throw StateError('Final save failed.');
+                if (await file.exists()) await file.delete();
+              });
+    _cleanupActions[task.id] = () async {
+      final partial = File('${target.path}.jet2drop-download-${task.id}.part');
+      if (await partial.exists()) await partial.delete();
+      if (deleteTargetOnCancel && await target.exists()) await target.delete();
+    };
+    _retryActions[task.id] = (retryTask) => _runDownloadTask(
+      retryTask,
+      entry: entry,
+      target: target,
+      finalize: finalizer,
+    );
+    await _rememberPending({
+      'kind': 'download',
+      'id': task.id,
+      'name': task.name,
+      'totalBytes': task.totalBytes,
+      'remotePath': entry.path,
+      'modifiedAt': entry.modifiedAt.toUtc().toIso8601String(),
+      'targetPath': target.path,
+      'androidTargetUri': ?androidTargetUri,
+      'deleteTargetOnCancel': deleteTargetOnCancel,
+    });
+    await _retryActions[task.id]!(task);
+    if (task.status == TransferStatus.failed) {
+      throw StateError(task.error ?? 'Download failed.');
+    }
+  }
+
+  Future<void> _runDownloadTask(
+    TransferTask task, {
+    required FileEntry entry,
+    required File target,
+    Future<void> Function(File file)? finalize,
+  }) async {
     final control = TransferControl();
     _transferControls[task.id] = control;
+    _syncForegroundTransfer(force: true);
+    task
+      ..status = TransferStatus.running
+      ..error = null
+      ..cancelRequested = false
+      ..isPaused = false;
     notifyListeners();
     try {
-      await _retryOperation(
-        () => _gateway!.downloadFile(
-          remotePath: entry.path,
-          target: target,
-          onProgress: (current, _) {
-            task.transferredBytes = current;
-            notifyListeners();
-          },
-          control: control,
-        ),
-      );
+      final alreadyDownloaded =
+          await target.exists() && await target.length() == entry.size;
+      if (!alreadyDownloaded) {
+        await _retryOperation(
+          () => _gateway!.downloadFile(
+            remotePath: entry.path,
+            target: target,
+            resumeId: task.id,
+            onProgress: (current, _) {
+              task.transferredBytes = current;
+              _notifyTransferProgress();
+            },
+            control: control,
+          ),
+        );
+      }
+      task
+        ..transferredBytes = task.totalBytes
+        ..status = TransferStatus.finalizing;
+      notifyListeners();
+      if (finalize != null) await finalize(target);
       task.status = TransferStatus.completed;
+      _cleanupActions.remove(task.id);
+      await _forgetPending(task.id);
     } catch (exception) {
       if (!task.cancelRequested) {
         task.status = TransferStatus.failed;
@@ -644,41 +1309,167 @@ class AppController extends ChangeNotifier {
       }
     }
     _transferControls.remove(task.id);
+    _syncForegroundTransfer(force: true);
     notifyListeners();
   }
 
+  Future<void> retryTask(TransferTask task) async {
+    if (task.status != TransferStatus.failed) return;
+    final action = _retryActions[task.id];
+    if (action == null) return;
+    task.transferredBytes = 0;
+    await action(task);
+    if (task.status == TransferStatus.completed) {
+      await refresh();
+    }
+  }
+
   void pauseTask(TransferTask task) {
-    if (task.status != TransferStatus.running || task.isPaused) return;
-    _transferControls[task.id]?.pause();
+    if (task.status != TransferStatus.running || task.isPaused) {
+      return;
+    }
     task.isPaused = true;
+    final control = _transferControls[task.id];
+    if (task.direction == TransferDirection.upload ||
+        task.direction == TransferDirection.quickSend) {
+      unawaited(control?.defer());
+    } else {
+      control?.pause();
+    }
     notifyListeners();
   }
 
   void resumeTask(TransferTask task) {
-    if (task.status != TransferStatus.running || !task.isPaused) return;
-    _transferControls[task.id]?.resume();
-    task.isPaused = false;
+    if (task.status != TransferStatus.running || !task.isPaused) {
+      return;
+    }
+    if (task.direction == TransferDirection.quickSend) {
+      task.isPaused = false;
+      final queued = _pausedQuickTransfers.remove(task.id);
+      if (queued != null) {
+        task.status = TransferStatus.queued;
+        _quickSendQueue.add(queued);
+        unawaited(_processQuickSendQueue());
+      } else {
+        _resumeAfterYield.add(task.id);
+      }
+    } else if (task.direction == TransferDirection.upload) {
+      task.isPaused = false;
+      if (_transferControls.containsKey(task.id)) {
+        _resumeAfterYield.add(task.id);
+      } else {
+        task.status = TransferStatus.queued;
+        final action = _retryActions[task.id];
+        if (action != null) unawaited(action(task));
+      }
+    } else {
+      _transferControls[task.id]?.resume();
+      task.isPaused = false;
+    }
     notifyListeners();
   }
 
   Future<void> cancelTask(TransferTask task) async {
-    if (task.status != TransferStatus.running) return;
+    final pausedQuick = _pausedQuickTransfers.remove(task.id);
+    if (pausedQuick != null) {
+      task
+        ..cancelRequested = true
+        ..status = TransferStatus.cancelled
+        ..isPaused = false
+        ..error = null;
+      if (!pausedQuick.completer.isCompleted) {
+        pausedQuick.completer.completeError(const TransferCancelled());
+      }
+      await _runTaskCleanup(task.id);
+      await _forgetPending(task.id);
+      notifyListeners();
+      return;
+    }
+    if (task.status == TransferStatus.queued) {
+      task.cancelRequested = true;
+      task.status = TransferStatus.cancelled;
+      final index = _quickSendQueue.indexWhere(
+        (queued) => queued.task.id == task.id,
+      );
+      if (index >= 0) {
+        final queued = _quickSendQueue.removeAt(index);
+        if (!queued.completer.isCompleted) {
+          queued.completer.completeError(const TransferCancelled());
+        }
+      }
+      await _runTaskCleanup(task.id);
+      await _forgetPending(task.id);
+      notifyListeners();
+      return;
+    }
+    if (task.status != TransferStatus.running) {
+      return;
+    }
     task.cancelRequested = true;
     task.status = TransferStatus.cancelled;
     task.isPaused = false;
     task.error = null;
     notifyListeners();
     await _transferControls[task.id]?.cancel();
+    await _runTaskCleanup(task.id);
+    await _forgetPending(task.id);
+    final settled = _taskSettled.remove(task.id);
+    if (settled != null && !settled.isCompleted) settled.complete();
+  }
+
+  Future<void> _runTaskCleanup(String taskId) async {
+    _completionCleanupActions.remove(taskId);
+    final cleanup = _cleanupActions.remove(taskId);
+    if (cleanup == null) return;
+    try {
+      await cleanup();
+    } catch (_) {
+      // Cleanup is best-effort and is retried by repository maintenance.
+    }
+  }
+
+  Future<void> _runCompletionCleanup(String taskId) async {
+    final cleanup = _completionCleanupActions.remove(taskId);
+    if (cleanup != null) await cleanup();
   }
 
   void removeTask(TransferTask task) {
-    if (task.status == TransferStatus.running) return;
+    if (task.status == TransferStatus.running ||
+        task.status == TransferStatus.finalizing ||
+        task.status == TransferStatus.queued) {
+      return;
+    }
     tasks.remove(task);
+    _retryActions.remove(task.id);
+    unawaited(_runTaskCleanup(task.id));
+    _completionCleanupActions.remove(task.id);
+    unawaited(_forgetPending(task.id));
+    _taskSettled.remove(task.id);
     notifyListeners();
   }
 
-  Future<File> previewFile(FileEntry entry) =>
-      _retryOperation(() => _gateway!.materializeForPreview(entry.path));
+  Future<void> clearFinishedTasks() async {
+    final finished = tasks
+        .where(
+          (task) =>
+              task.status == TransferStatus.completed ||
+              task.status == TransferStatus.cancelled,
+        )
+        .toList(growable: false);
+    for (final task in finished) {
+      tasks.remove(task);
+      _retryActions.remove(task.id);
+      await _runTaskCleanup(task.id);
+      await _forgetPending(task.id);
+      _taskSettled.remove(task.id);
+    }
+    notifyListeners();
+  }
+
+  Future<File> previewFile(FileEntry entry, {TransferControl? control}) =>
+      _retryOperation(
+        () => _gateway!.materializeForPreview(entry.path, control: control),
+      );
 
   Future<void> releasePreview(File file) async {
     if (mode == RepositoryMode.sftp && await file.exists()) {
@@ -699,63 +1490,193 @@ class AppController extends ChangeNotifier {
         'The target device is unavailable or belongs to this device.',
       );
     }
+    await validateTransferSelection([source]);
+    final taskId = uniqueSuffix();
+    final durableSource = await _prepareDurableSource(source, taskId);
     final task = TransferTask(
-      id: uniqueSuffix(),
-      name: source.uri.pathSegments.last,
-      direction: TransferDirection.quickDrop,
-      totalBytes: await source.length(),
-      status: TransferStatus.running,
+      id: taskId,
+      name: sanitizeTransferFileName(source.uri.pathSegments.last),
+      direction: TransferDirection.quickSend,
+      totalBytes: await durableSource.file.length(),
+      status: TransferStatus.queued,
     );
     tasks.insert(0, task);
-    final control = TransferControl();
-    _transferControls[task.id] = control;
+    final queued = _QueuedQuickTransfer(
+      source: durableSource.file,
+      targetDevice: target,
+      task: task,
+    );
+    _quickSendQueue.add(queued);
+    _syncForegroundTransfer(force: true);
+    _cleanupActions[task.id] = () async {
+      try {
+        await _gateway!.deleteEntry(
+          '$_quickRoot/$_quickMessages/${task.id}',
+          recursive: true,
+        );
+      } catch (_) {}
+      await durableSource.deleteIfOwned();
+    };
+    _completionCleanupActions[task.id] = durableSource.deleteIfOwned;
+    await _rememberPending({
+      'kind': 'quick',
+      'id': task.id,
+      'sourcePath': durableSource.file.path,
+      'ownedSource': durableSource.owned,
+      'name': task.name,
+      'totalBytes': task.totalBytes,
+      'targetDevice': target,
+    });
+    _retryActions[task.id] = (retryTask) async {
+      final retry = _QueuedQuickTransfer(
+        source: durableSource.file,
+        targetDevice: target,
+        task: retryTask,
+      );
+      _quickSendQueue.add(retry);
+      notifyListeners();
+      unawaited(_processQuickSendQueue());
+      await retry.completer.future;
+    };
     notifyListeners();
+
+    unawaited(_processQuickSendQueue());
+    return queued.completer.future;
+  }
+
+  Future<void> _processQuickSendQueue() async {
+    if (_isProcessingQuickSendQueue) return;
+    _isProcessingQuickSendQueue = true;
+    try {
+      while (_quickSendQueue.isNotEmpty) {
+        final queued = _quickSendQueue.removeAt(0);
+        final task = queued.task;
+        if (task.cancelRequested || task.status == TransferStatus.cancelled) {
+          if (!queued.completer.isCompleted) {
+            queued.completer.completeError(const TransferCancelled());
+          }
+          continue;
+        }
+
+        final control = TransferControl();
+        _transferControls[task.id] = control;
+        _syncForegroundTransfer(force: true);
+        task.status = TransferStatus.running;
+        task.error = null;
+        notifyListeners();
+
+        try {
+          final manifest = await _executeQuickTransfer(
+            queued.source,
+            targetDevice: queued.targetDevice,
+            task: task,
+            control: control,
+          );
+          task.transferredBytes = task.totalBytes;
+          task.status = TransferStatus.completed;
+          _cleanupActions.remove(task.id);
+          await _runCompletionCleanup(task.id);
+          await _forgetPending(task.id);
+          if (!queued.completer.isCompleted) {
+            queued.completer.complete(manifest);
+          }
+        } catch (exception, stackTrace) {
+          if (control.isDeferred && !task.cancelRequested) {
+            task.error = null;
+            final resumeImmediately = _resumeAfterYield.remove(task.id);
+            if (resumeImmediately) {
+              task
+                ..isPaused = false
+                ..status = TransferStatus.queued;
+              _quickSendQueue.add(queued);
+            } else {
+              task
+                ..isPaused = true
+                ..status = TransferStatus.running;
+              _pausedQuickTransfers[task.id] = queued;
+            }
+          } else if (!task.cancelRequested) {
+            task.status = TransferStatus.failed;
+            task.error = describeError(exception);
+            if (!queued.completer.isCompleted) {
+              queued.completer.completeError(exception, stackTrace);
+            }
+          } else if (!queued.completer.isCompleted) {
+            queued.completer.completeError(exception, stackTrace);
+          }
+        } finally {
+          _transferControls.remove(task.id);
+          _syncForegroundTransfer(force: true);
+          notifyListeners();
+        }
+      }
+    } finally {
+      _isProcessingQuickSendQueue = false;
+      if (_quickSendQueue.isNotEmpty) {
+        unawaited(_processQuickSendQueue());
+      } else if (isReady) {
+        unawaited(refreshQuickTransfer());
+      }
+    }
+  }
+
+  Future<QuickTransferManifest> _executeQuickTransfer(
+    File source, {
+    required String targetDevice,
+    required TransferTask task,
+    required TransferControl control,
+  }) async {
     Directory? staging;
     try {
-      await _resetConnection();
+      await _ensureRemoteSpace(task.totalBytes, _quickRoot);
       final support = await getApplicationSupportDirectory();
       staging = Directory(
         '${support.path}${Platform.pathSeparator}quick-transfer-staging${Platform.pathSeparator}${uniqueSuffix()}',
       );
-      final manifest = await quickTransfer.publish(
+      await staging.create(recursive: true);
+      final manifest = await quickTransfer.inspect(
         source,
-        staging,
         senderDevice: deviceId,
-        targetDevice: target,
+        targetDevice: targetDevice,
+        transferId: task.id,
         onProgress: (current, total) {
           // Local staging is preparation, not network transfer. Keep it in a
           // small initial range so the visible progress reflects upload work.
           task.transferredBytes = total == 0
               ? 0
               : (task.totalBytes * current ~/ total ~/ 20);
-          notifyListeners();
+          _notifyTransferProgress();
         },
       );
       final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
       await _ensureDirectory('$_quickRoot/$_quickMessages', manifest.id);
-      final payload = File(
-        '${staging.path}${Platform.pathSeparator}${manifest.id}.bin',
-      );
       final manifestFile = File(
         '${staging.path}${Platform.pathSeparator}${manifest.id}.json',
       );
+      await manifestFile.writeAsString(
+        jsonEncode(manifest.toJson()),
+        flush: true,
+      );
       await _retryOperation(
         () => _gateway!.uploadFile(
-          source: payload,
+          source: source,
           targetDirectory: remotePackage,
           targetName: 'payload.bin',
           overwrite: true,
+          resumeId: task.id,
           control: control,
           onProgress: (current, total) {
             task.transferredBytes = total == 0
                 ? task.totalBytes ~/ 20
                 : task.totalBytes ~/ 20 +
-                      ((task.totalBytes * 19 ~/ 20) * current ~/ total);
-            notifyListeners();
+                      ((task.totalBytes * 93 ~/ 100) * current ~/ total);
+            _notifyTransferProgress();
           },
         ),
       );
       await control.checkpoint();
+      task.status = TransferStatus.finalizing;
+      notifyListeners();
       await _retryOperation(
         () => _gateway!.uploadFile(
           source: manifestFile,
@@ -765,24 +1686,10 @@ class AppController extends ChangeNotifier {
           control: control,
         ),
       );
-      task.transferredBytes = task.totalBytes;
-      task.status = TransferStatus.completed;
-      notifyListeners();
       return manifest;
-    } catch (exception) {
-      if (!task.cancelRequested) {
-        task.status = TransferStatus.failed;
-        task.error = describeError(exception);
-      }
-      notifyListeners();
-      rethrow;
     } finally {
-      _transferControls.remove(task.id);
       if (staging != null && await staging.exists()) {
         await staging.delete(recursive: true);
-      }
-      if (task.status == TransferStatus.completed) {
-        await refreshQuickTransfer();
       }
     }
   }
@@ -791,6 +1698,11 @@ class AppController extends ChangeNotifier {
     QuickTransferManifest manifest, {
     required File target,
     bool finalize = true,
+    void Function(TransferTask task)? onTaskCreated,
+    Future<void> Function(File file)? saveTarget,
+    String? androidTargetUri,
+    bool saveAsMedia = false,
+    String mimeType = 'application/octet-stream',
   }) async {
     if (!canClaimQuickTransfer(manifest)) {
       throw StateError(
@@ -800,50 +1712,170 @@ class AppController extends ChangeNotifier {
     final task = TransferTask(
       id: uniqueSuffix(),
       name: manifest.name,
-      direction: TransferDirection.quickDrop,
+      direction: TransferDirection.quickReceive,
       totalBytes: manifest.size,
       status: TransferStatus.running,
     );
     tasks.insert(0, task);
-    final control = TransferControl();
-    _transferControls[task.id] = control;
-    Directory? staging;
-    try {
-      await _resetConnection();
+    onTaskCreated?.call(task);
+    final targetSaver =
+        saveTarget ??
+        (Platform.isAndroid
+            ? (File file) => _saveAndroidQuickTarget(
+                file,
+                manifest: manifest,
+                targetUri: androidTargetUri,
+                saveAsMedia: saveAsMedia,
+                mimeType: mimeType,
+              )
+            : null);
+    _retryActions[task.id] = (retryTask) => _runQuickReceiveTask(
+      retryTask,
+      manifest: manifest,
+      target: target,
+      finalize: finalize,
+      saveTarget: targetSaver,
+    );
+    _cleanupActions[task.id] = () async {
       final support = await getApplicationSupportDirectory();
-      staging = Directory(
+      final staging = Directory(
         '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
       );
-      await staging.create(recursive: true);
-      final payload = File(
-        '${staging.path}${Platform.pathSeparator}${manifest.id}.bin',
-      );
-      final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
-      await _retryOperation(
-        () => _gateway!.downloadFile(
-          remotePath: '$remotePackage/payload.bin',
-          target: payload,
-          control: control,
-          onProgress: (current, _) {
-            task.transferredBytes = current;
-            notifyListeners();
-          },
-        ),
-      );
-      await control.checkpoint();
-      await quickTransfer.receive(manifest, staging, target);
+      if (await staging.exists()) await staging.delete(recursive: true);
+      if (Platform.isAndroid && await target.exists()) await target.delete();
+    };
+    await _rememberPending({
+      'kind': 'quickReceive',
+      'id': task.id,
+      'name': task.name,
+      'totalBytes': task.totalBytes,
+      'manifest': manifest.toJson(),
+      'targetPath': target.path,
+      'androidTargetUri': ?androidTargetUri,
+      'saveAsMedia': saveAsMedia,
+      'mimeType': mimeType,
+      'locallySaved': false,
+    });
+    await _retryActions[task.id]!(task);
+    if (task.status == TransferStatus.failed) {
+      throw StateError(task.error ?? 'Quick transfer failed.');
+    }
+  }
+
+  Future<void> _saveAndroidQuickTarget(
+    File file, {
+    required QuickTransferManifest manifest,
+    required String? targetUri,
+    required bool saveAsMedia,
+    required String mimeType,
+  }) async {
+    final saved = saveAsMedia
+        ? await AndroidSaveFile.saveMedia(
+            source: file,
+            suggestedName: manifest.name,
+            mimeType: mimeType,
+          )
+        : await AndroidSaveFile.saveToDocumentTarget(
+            source: file,
+            targetUri: targetUri!,
+          );
+    if (!saved) throw StateError('Final save failed.');
+    if (await file.exists()) await file.delete();
+  }
+
+  Future<void> _runQuickReceiveTask(
+    TransferTask task, {
+    required QuickTransferManifest manifest,
+    required File target,
+    required bool finalize,
+    Future<void> Function(File file)? saveTarget,
+  }) async {
+    final control = TransferControl();
+    _transferControls[task.id] = control;
+    _syncForegroundTransfer(force: true);
+    task
+      ..status = TransferStatus.running
+      ..error = null
+      ..cancelRequested = false
+      ..isPaused = false;
+    notifyListeners();
+    Directory? staging;
+    var completed = false;
+    try {
+      if (!_quickLocallySaved.contains(task.id)) {
+        final alreadyDownloaded =
+            await target.exists() && await target.length() == manifest.size;
+        if (!alreadyDownloaded) {
+          await _resetConnection();
+          final support = await getApplicationSupportDirectory();
+          staging = Directory(
+            '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
+          );
+          await staging.create(recursive: true);
+          final payload = File(
+            '${staging.path}${Platform.pathSeparator}${manifest.id}.bin',
+          );
+          _cleanupActions[task.id] = () async {
+            if (await staging!.exists()) await staging.delete(recursive: true);
+            if (await target.exists()) await target.delete();
+          };
+          final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
+          await _retryOperation(
+            () => _gateway!.downloadFile(
+              remotePath: '$remotePackage/payload.bin',
+              target: payload,
+              resumeId: manifest.id,
+              control: control,
+              onProgress: (current, _) {
+                task.transferredBytes = current;
+                _notifyTransferProgress();
+              },
+            ),
+          );
+          await control.checkpoint();
+          task.status = TransferStatus.finalizing;
+          notifyListeners();
+          await quickTransfer.verifyAndPublish(
+            manifest,
+            payload,
+            target,
+            onProgress: (current, _) {
+              task.transferredBytes = current;
+              _notifyTransferProgress();
+            },
+          );
+        }
+        task.status = TransferStatus.finalizing;
+        notifyListeners();
+        if (saveTarget != null) await saveTarget(target);
+        _quickLocallySaved.add(task.id);
+        final record = _pendingTransferRecords[task.id];
+        if (record != null) {
+          record['locallySaved'] = true;
+          await _persistPendingTransfers();
+        }
+      }
       if (finalize) await markQuickTransferClaimed(manifest);
+      _quickLocallySaved.remove(task.id);
       task.transferredBytes = task.totalBytes;
       task.status = TransferStatus.completed;
+      completed = true;
+      _cleanupActions.remove(task.id);
+      await _forgetPending(task.id);
     } catch (exception) {
       if (!task.cancelRequested) {
         task.status = TransferStatus.failed;
-        task.error = describeError(exception);
+        task.error = _quickLocallySaved.contains(task.id)
+            ? '文件已经保存，领取状态尚未同步，可点击重试。'
+            : describeError(exception);
       }
       rethrow;
     } finally {
       _transferControls.remove(task.id);
-      if (staging != null && await staging.exists()) {
+      _syncForegroundTransfer(force: true);
+      if ((completed || task.cancelRequested) &&
+          staging != null &&
+          await staging.exists()) {
         await staging.delete(recursive: true);
       }
       if (task.status == TransferStatus.completed) {
@@ -925,26 +1957,25 @@ class AppController extends ChangeNotifier {
   }
 
   Future<T> _retryOperation<T>(Future<T> Function() operation) async {
-    Object? lastException;
-    StackTrace? lastStackTrace;
-    for (var attempt = 0; attempt < 3; attempt++) {
-      try {
-        if (attempt > 0) await _resetConnection();
-        return await operation();
-      } catch (exception, stackTrace) {
-        if (exception is TransferCancelled) {
-          Error.throwWithStackTrace(exception, stackTrace);
-        }
-        lastException = exception;
-        lastStackTrace = stackTrace;
-        if (attempt < 2) {
-          await Future<void>.delayed(
-            Duration(milliseconds: 400 * (attempt + 1)),
-          );
-        }
+    try {
+      final result = await ConnectionRetry(
+        resetConnection: _resetConnection,
+        beforeRetry: (_) {
+          connectionStatus = RepositoryConnectionStatus.retrying;
+          notifyListeners();
+        },
+      ).run(operation);
+      if (isReady) connectionStatus = RepositoryConnectionStatus.connected;
+      return result;
+    } catch (exception) {
+      if (_isTailscaleConnectivityError(exception) ||
+          exception is SocketException ||
+          exception is TimeoutException) {
+        connectionStatus = RepositoryConnectionStatus.disconnected;
+        notifyListeners();
       }
+      rethrow;
     }
-    Error.throwWithStackTrace(lastException!, lastStackTrace!);
   }
 
   Future<void> toggleTheme() async {
@@ -953,19 +1984,164 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _runSimple(Future<void> Function() action) async {
-    try {
-      await action();
-      error = null;
-    } catch (exception) {
-      error = describeError(exception);
+  Future<void> setSort(FileSortField field, {bool? ascending}) async {
+    sortField = field;
+    if (ascending != null) sortAscending = ascending;
+    await _preferences.setString(_sortFieldKey, sortField.name);
+    await _preferences.setBool(_sortAscendingKey, sortAscending);
+    notifyListeners();
+  }
+
+  Future<int> validateTransferSelection(List<File> files) async {
+    if (files.isEmpty) return 0;
+    if (files.length > maxTransferFiles) {
+      throw StateError(
+        'A transfer can contain at most $maxTransferFiles files.',
+      );
     }
+    var total = 0;
+    for (final file in files) {
+      if (!await file.exists()) {
+        throw FileSystemException('Selected file is unavailable.', file.path);
+      }
+      total += await file.length();
+      if (total > maxTransferBytes) {
+        throw StateError('A transfer cannot exceed 10 GB.');
+      }
+    }
+    return total;
+  }
+
+  Future<void> _ensureRemoteSpace(int requiredBytes, String path) async {
+    final available = await _retryOperation(
+      () => _gateway!.availableBytes(path),
+    );
+    const reserve = 16 * 1024 * 1024;
+    if (available != null && available < requiredBytes + reserve) {
+      throw StateError('The destination does not have enough free space.');
+    }
+  }
+
+  Future<void> _recoverTemporaryFiles(String path) async {
+    try {
+      await _gateway?.recoverTemporaryFiles(path);
+    } catch (_) {
+      // Recovery is maintenance and must not make a healthy folder unusable.
+    }
+  }
+
+  void _syncForegroundTransfer({bool force = false}) {
+    if (hasRunningTransfers && _isRefreshingQuickTransfer) {
+      _quickRefreshGeneration++;
+      _quickRefreshPending = true;
+    }
+    if (!hasRunningTransfers) {
+      if (_repositoryRefreshPending) unawaited(refresh());
+      if (_quickRefreshPending) unawaited(refreshQuickTransfer());
+    }
+    if (Platform.isWindows) {
+      unawaited(WindowsLifecycleBridge.setActiveTransfers(hasActiveTransfers));
+    }
+    if (!Platform.isAndroid) return;
+    final now = DateTime.now();
+    if (!force &&
+        _lastForegroundUpdate != null &&
+        now.difference(_lastForegroundUpdate!) <
+            const Duration(milliseconds: 500)) {
+      return;
+    }
+    _lastForegroundUpdate = now;
+    final active = tasks
+        .where((task) => _transferControls.containsKey(task.id))
+        .toList(growable: false);
+    if (active.isEmpty) {
+      if (_foregroundTransferActive) {
+        _foregroundTransferActive = false;
+        unawaited(AndroidTransferService.stop());
+      }
+      return;
+    }
+    final total = active.fold<int>(0, (sum, task) => sum + task.totalBytes);
+    final current = active.fold<int>(
+      0,
+      (sum, task) => sum + task.transferredBytes.clamp(0, task.totalBytes),
+    );
+    final progress = total <= 0 ? 0 : (current * 1000 ~/ total).clamp(0, 1000);
+    if (_foregroundTransferActive) {
+      unawaited(
+        AndroidTransferService.update(
+          current: progress,
+          total: 1000,
+          tasks: active.length,
+        ),
+      );
+    } else {
+      _foregroundTransferActive = true;
+      unawaited(
+        AndroidTransferService.start(
+          current: progress,
+          total: 1000,
+          tasks: active.length,
+        ),
+      );
+    }
+  }
+
+  void _notifyTransferProgress() {
+    _syncForegroundTransfer();
+    final now = DateTime.now();
+    final elapsed = _lastTransferUiUpdate == null
+        ? const Duration(seconds: 1)
+        : now.difference(_lastTransferUiUpdate!);
+    if (elapsed >= const Duration(milliseconds: 100)) {
+      _lastTransferUiUpdate = now;
+      _transferUiTimer?.cancel();
+      _transferUiTimer = null;
+      notifyListeners();
+      return;
+    }
+    _transferUiTimer ??= Timer(const Duration(milliseconds: 100) - elapsed, () {
+      _transferUiTimer = null;
+      _lastTransferUiUpdate = DateTime.now();
+      notifyListeners();
+    });
   }
 
   @override
   void dispose() {
     _quickMaintenanceTimer?.cancel();
+    _transferUiTimer?.cancel();
     _gateway?.dispose();
     super.dispose();
+  }
+}
+
+String _fileExtension(String name) {
+  final dot = name.lastIndexOf('.');
+  return dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
+}
+
+class _QueuedQuickTransfer {
+  _QueuedQuickTransfer({
+    required this.source,
+    required this.targetDevice,
+    required this.task,
+  });
+
+  final File source;
+  final String targetDevice;
+  final TransferTask task;
+  final Completer<QuickTransferManifest> completer =
+      Completer<QuickTransferManifest>();
+}
+
+class _DurableSource {
+  const _DurableSource(this.file, {required this.owned});
+
+  final File file;
+  final bool owned;
+
+  Future<void> deleteIfOwned() async {
+    if (owned && await file.exists()) await file.delete();
   }
 }

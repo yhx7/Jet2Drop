@@ -7,6 +7,8 @@ typedef ProgressCallback = void Function(int transferred, int total);
 
 abstract interface class RepositoryGateway {
   Future<void> initialize();
+  Future<int?> availableBytes(String relativePath);
+  Future<void> recoverTemporaryFiles(String relativePath);
   Future<List<FileEntry>> listDirectory(String relativePath);
   Future<void> createDirectory(String relativePath, String name);
   Future<void> deleteEntry(String relativePath, {required bool recursive});
@@ -15,15 +17,25 @@ abstract interface class RepositoryGateway {
     required String targetDirectory,
     required String targetName,
     required bool overwrite,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
+  });
+  Future<void> discardUploadPartial({
+    required String targetDirectory,
+    required String targetName,
+    required String resumeId,
   });
   Future<void> downloadFile({
     required String remotePath,
     required File target,
+    String? resumeId,
     ProgressCallback? onProgress,
     TransferControl? control,
   });
-  Future<File> materializeForPreview(String relativePath);
+  Future<File> materializeForPreview(
+    String relativePath, {
+    TransferControl? control,
+  });
   Future<void> dispose();
 }

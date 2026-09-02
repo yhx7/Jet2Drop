@@ -6,7 +6,16 @@ class AndroidMediaPicker {
   static const _channel = MethodChannel('jet2drop/media_picker');
 
   static Future<List<File>> pickImagesAndVideos() async {
-    final paths = await _channel.invokeListMethod<String>('pickImagesAndVideos');
+    final paths = await _channel.invokeListMethod<String>(
+      'pickImagesAndVideos',
+    );
     return (paths ?? const <String>[]).map(File.new).toList();
+  }
+
+  static Future<void> cleanup(List<File> files) async {
+    if (!Platform.isAndroid || files.isEmpty) return;
+    await _channel.invokeMethod<void>('cleanupPickedMedia', {
+      'paths': files.map((file) => file.path).toList(growable: false),
+    });
   }
 }

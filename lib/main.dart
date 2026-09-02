@@ -10,7 +10,9 @@ import 'package:path_provider/path_provider.dart';
 import 'app_controller.dart';
 import 'core/models/file_entry.dart';
 import 'core/models/transfer_task.dart';
+import 'core/path_utils.dart';
 import 'core/quick_transfer.dart';
+import 'core/transfer_control.dart';
 import 'infrastructure/sftp_repository_gateway.dart';
 import 'platform/android_media_picker.dart';
 import 'platform/android_save_file.dart';
@@ -129,7 +131,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _quickRefreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+    _quickRefreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       if (mounted && _page == 1 && controller.isReady) {
         unawaited(controller.refreshQuickTransfer());
       }
@@ -145,9 +147,12 @@ class _RepositoryPageState extends State<RepositoryPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _awaitingTailscale) {
-      _awaitingTailscale = false;
-      unawaited(controller.connect());
+    if (state == AppLifecycleState.resumed) {
+      if (_awaitingTailscale) {
+        _awaitingTailscale = false;
+        _message('正在重新连接…');
+      }
+      unawaited(controller.onAppResumed());
     }
   }
 
@@ -156,6 +161,7 @@ class _RepositoryPageState extends State<RepositoryPage>
     final wide = MediaQuery.sizeOf(context).width >= 840;
     final content = switch (_page) {
       0 => _repositoryView(),
+      1 when !controller.isReady => _connectionRequired(),
       1 => _quickTransferView(),
       _ => _taskView(),
     };
@@ -174,7 +180,9 @@ class _RepositoryPageState extends State<RepositoryPage>
           ),
           IconButton(
             tooltip: '连接设置',
-            onPressed: _showConnectionDialog,
+            onPressed: controller.hasActiveTransfers || controller.isLoading
+                ? null
+                : _showConnectionDialog,
             icon: const Icon(Icons.settings_outlined),
           ),
           const SizedBox(width: 8),
@@ -240,14 +248,16 @@ class _RepositoryPageState extends State<RepositoryPage>
 
   void _selectPage(int value) {
     setState(() => _page = value);
-    if (value == 1) unawaited(controller.refreshQuickTransfer());
+    if (value == 1 && controller.isReady) {
+      unawaited(controller.refreshQuickTransfer());
+    }
   }
 
   Widget _repositoryView() {
     if (controller.isInitializing) {
       return const Center(child: CircularProgressIndicator());
     }
-    if (!controller.isReady && controller.error != null) {
+    if (!controller.isReady) {
       return _connectionRequired();
     }
     return Column(
@@ -291,13 +301,13 @@ class _RepositoryPageState extends State<RepositoryPage>
               ),
               child: controller.isLoading
                   ? const Center(child: CircularProgressIndicator())
-                  : controller.entries.isEmpty
+                  : controller.sortedEntries.isEmpty
                   ? Center(child: Text(_dragging ? '松开以上传到当前目录' : '此目录为空'))
                   : ListView.separated(
-                      itemCount: controller.entries.length,
+                      itemCount: controller.sortedEntries.length,
                       separatorBuilder: (_, _) => const Divider(height: 1),
                       itemBuilder: (_, index) =>
-                          _entryTile(controller.entries[index]),
+                          _entryTile(controller.sortedEntries[index]),
                     ),
             ),
           ),
@@ -314,24 +324,42 @@ class _RepositoryPageState extends State<RepositoryPage>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.cloud_off_outlined, size: 48),
+            Icon(
+              controller.isLoading
+                  ? Icons.cloud_sync_outlined
+                  : Icons.cloud_off_outlined,
+              size: 48,
+            ),
             const SizedBox(height: 16),
-            const Text(
-              '尚未连接到仓库',
+            Text(
+              controller.isLoading ? '正在连接仓库' : '尚未连接到仓库',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 8),
-            Text(controller.error!, textAlign: TextAlign.center),
-            const SizedBox(height: 20),
-            if (controller.needsTailscale)
-              FilledButton.icon(
-                onPressed: _openTailscaleAndRetry,
-                icon: const Icon(Icons.vpn_key_outlined),
-                label: const Text('打开 Tailscale 并自动重试'),
+            if (controller.error case final error?)
+              Text(error, textAlign: TextAlign.center)
+            else
+              const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 10),
+                  Text('正在连接…'),
+                ],
               ),
-            if (controller.needsTailscale) const SizedBox(height: 10),
+            const SizedBox(height: 20),
             FilledButton.icon(
-              onPressed: _showConnectionDialog,
+              onPressed: controller.isLoading ? null : _retryConnection,
+              icon: const Icon(Icons.refresh),
+              label: const Text('重试'),
+            ),
+            const SizedBox(height: 10),
+            FilledButton.icon(
+              onPressed: controller.isLoading ? null : _showConnectionDialog,
               icon: const Icon(Icons.settings),
               label: const Text('连接设置'),
             ),
@@ -341,13 +369,25 @@ class _RepositoryPageState extends State<RepositoryPage>
     ),
   );
 
-  Future<void> _openTailscaleAndRetry() async {
+  Future<void> _retryConnection() async {
+    await controller.connect();
+    if (!mounted || controller.isReady) return;
+
+    final shouldOpenTailscale = Platform.isAndroid
+        ? !await TailscaleBridge.isActive()
+        : controller.needsTailscale;
+    if (!mounted || !shouldOpenTailscale) return;
+
+    _message('未检测到 Tailscale 连接，正在打开 Tailscale…');
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (!mounted) return;
+
     _awaitingTailscale = true;
     final opened = await TailscaleBridge.open();
     if (!mounted) return;
     if (!opened) {
       _awaitingTailscale = false;
-      _message('请启动 Tailscale');
+      _message('无法启动 Tailscale，请确认已安装');
     }
   }
 
@@ -369,19 +409,52 @@ class _RepositoryPageState extends State<RepositoryPage>
           ),
         ],
       );
-      final actions = Row(
-        mainAxisSize: MainAxisSize.min,
+      final fileActions = Wrap(
+        alignment: WrapAlignment.center,
+        spacing: 8,
+        runSpacing: 4,
         children: [
           FilledButton.icon(
             onPressed: _pickUpload,
             icon: const Icon(Icons.upload_file),
             label: const Text('上传'),
           ),
-          const SizedBox(width: 8),
           OutlinedButton.icon(
             onPressed: _createFolder,
             icon: const Icon(Icons.create_new_folder_outlined),
             label: const Text('新建文件夹'),
+          ),
+        ],
+      );
+      final sorting = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: controller.sortAscending ? '当前升序' : '当前降序',
+            onPressed: () => controller.setSort(
+              controller.sortField,
+              ascending: !controller.sortAscending,
+            ),
+            icon: Icon(
+              controller.sortAscending
+                  ? Icons.arrow_upward
+                  : Icons.arrow_downward,
+            ),
+          ),
+          PopupMenuButton<FileSortField>(
+            tooltip: '排序',
+            icon: const Icon(Icons.sort),
+            initialValue: controller.sortField,
+            onSelected: controller.setSort,
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: FileSortField.name, child: Text('按名称')),
+              PopupMenuItem(value: FileSortField.type, child: Text('按类型')),
+              PopupMenuItem(value: FileSortField.size, child: Text('按大小')),
+              PopupMenuItem(
+                value: FileSortField.modifiedAt,
+                child: Text('按修改时间'),
+              ),
+            ],
           ),
         ],
       );
@@ -391,12 +464,12 @@ class _RepositoryPageState extends State<RepositoryPage>
             ? Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Center(child: actions),
-                  const SizedBox(height: 4),
-                  navigation,
+                  Center(child: fileActions),
+                  const SizedBox(height: 8),
+                  Row(children: [navigation, const Spacer(), sorting]),
                 ],
               )
-            : Row(children: [navigation, const Spacer(), actions]),
+            : Row(children: [navigation, sorting, const Spacer(), fileActions]),
       );
     },
   );
@@ -419,8 +492,43 @@ class _RepositoryPageState extends State<RepositoryPage>
             ),
             Text(parts[index]),
           ],
+          const Spacer(),
+          _connectionStatusChip(),
         ],
       ),
+    );
+  }
+
+  Widget _connectionStatusChip() {
+    final (label, color, icon) = switch (controller.connectionStatus) {
+      RepositoryConnectionStatus.connected => (
+        '已连接',
+        Colors.green,
+        Icons.cloud_done_outlined,
+      ),
+      RepositoryConnectionStatus.connecting => (
+        '连接中',
+        Colors.orange,
+        Icons.cloud_sync_outlined,
+      ),
+      RepositoryConnectionStatus.retrying => (
+        '重连中',
+        Colors.orange,
+        Icons.sync_outlined,
+      ),
+      RepositoryConnectionStatus.disconnected => (
+        '未连接',
+        Colors.red,
+        Icons.cloud_off_outlined,
+      ),
+    };
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 16, color: color),
+        const SizedBox(width: 4),
+        Text(label, style: TextStyle(color: color, fontSize: 12)),
+      ],
     );
   }
 
@@ -513,13 +621,37 @@ class _RepositoryPageState extends State<RepositoryPage>
         ],
       ),
     );
-    if (confirmed == true) await controller.deleteEntry(entry);
+    if (confirmed == true) {
+      try {
+        await controller.deleteEntry(entry);
+        if (mounted) _message('已删除');
+      } catch (exception) {
+        if (mounted) _message(controller.describeError(exception));
+      }
+    }
   }
 
   Widget _taskView() => ListView(
     padding: const EdgeInsets.all(16),
     children: [
-      Text('传输任务', style: Theme.of(context).textTheme.titleLarge),
+      Row(
+        children: [
+          Text('传输任务', style: Theme.of(context).textTheme.titleLarge),
+          const Spacer(),
+          TextButton.icon(
+            onPressed:
+                controller.tasks.any(
+                  (task) =>
+                      task.status == TransferStatus.completed ||
+                      task.status == TransferStatus.cancelled,
+                )
+                ? controller.clearFinishedTasks
+                : null,
+            icon: const Icon(Icons.cleaning_services_outlined),
+            label: const Text('清理已结束'),
+          ),
+        ],
+      ),
       const SizedBox(height: 12),
       if (controller.tasks.isEmpty)
         const Padding(
@@ -572,6 +704,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                 if (selected == null) return;
                 await _sendQuickFiles(
                   detail.files.map((item) => File(item.path)).toList(),
+                  targetDevice: selected,
                 );
               },
               child: DecoratedBox(
@@ -593,6 +726,9 @@ class _RepositoryPageState extends State<RepositoryPage>
                       ),
                       const SizedBox(height: 16),
                       DropdownButtonFormField<String>(
+                        key: ValueKey(
+                          'quick-target-$selected-${recipients.map((device) => device.id).join(',')}',
+                        ),
                         initialValue: selected,
                         isExpanded: true,
                         decoration: const InputDecoration(
@@ -625,7 +761,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                                   FilledButton.icon(
                                     onPressed: selected == null
                                         ? null
-                                        : _pickQuickMedia,
+                                        : () => _pickQuickMedia(selected),
                                     icon: const Icon(Icons.perm_media_outlined),
                                     label: const Text('传图片或视频'),
                                   ),
@@ -633,7 +769,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                                   OutlinedButton.icon(
                                     onPressed: selected == null
                                         ? null
-                                        : _pickQuickFiles,
+                                        : () => _pickQuickFiles(selected),
                                     icon: const Icon(
                                       Icons.attach_file_outlined,
                                     ),
@@ -648,14 +784,14 @@ class _RepositoryPageState extends State<RepositoryPage>
                                   FilledButton.icon(
                                     onPressed: selected == null
                                         ? null
-                                        : _pickQuickMedia,
+                                        : () => _pickQuickMedia(selected),
                                     icon: const Icon(Icons.perm_media_outlined),
                                     label: const Text('传图片或视频'),
                                   ),
                                   OutlinedButton.icon(
                                     onPressed: selected == null
                                         ? null
-                                        : _pickQuickFiles,
+                                        : () => _pickQuickFiles(selected),
                                     icon: const Icon(
                                       Icons.attach_file_outlined,
                                     ),
@@ -665,7 +801,9 @@ class _RepositoryPageState extends State<RepositoryPage>
                               )
                       else
                         FilledButton.icon(
-                          onPressed: selected == null ? null : _pickQuickFiles,
+                          onPressed: selected == null
+                              ? null
+                              : () => _pickQuickFiles(selected),
                           icon: const Icon(Icons.attach_file_outlined),
                           label: const Text('选择文件'),
                         ),
@@ -845,7 +983,7 @@ class _RepositoryPageState extends State<RepositoryPage>
     }
   }
 
-  Future<void> _pickQuickFiles() async {
+  Future<void> _pickQuickFiles(String targetDevice) async {
     final files = await openFiles(
       acceptedTypeGroups: const [
         XTypeGroup(label: '所有文件', extensions: <String>[]),
@@ -854,13 +992,13 @@ class _RepositoryPageState extends State<RepositoryPage>
     if (files.isEmpty) return;
     final materialized = await _materialize(files);
     try {
-      await _sendQuickFiles(materialized);
+      await _sendQuickFiles(materialized, targetDevice: targetDevice);
     } finally {
       await _cleanMaterializedUploads();
     }
   }
 
-  Future<void> _pickQuickMedia() async {
+  Future<void> _pickQuickMedia(String targetDevice) async {
     final List<File> files;
     if (Platform.isAndroid) {
       files = await AndroidMediaPicker.pickImagesAndVideos();
@@ -870,26 +1008,65 @@ class _RepositoryPageState extends State<RepositoryPage>
           .toList();
     }
     if (files.isEmpty) return;
-    await _sendQuickFiles(files);
+    try {
+      await _sendQuickFiles(files, targetDevice: targetDevice);
+    } finally {
+      if (Platform.isAndroid) await AndroidMediaPicker.cleanup(files);
+    }
   }
 
-  Future<void> _sendQuickFiles(List<File> files) async {
-    final target = _quickTarget.isNotEmpty
-        ? _quickTarget
-        : controller.quickRecipients.firstOrNull?.id ?? '';
+  Future<void> _sendQuickFiles(
+    List<File> files, {
+    required String targetDevice,
+  }) async {
+    final target = targetDevice;
     if (target.isEmpty) {
       if (mounted) _message('请先选择目标设备');
       return;
     }
-    for (final file in files) {
-      try {
-        await controller.publishQuickTransfer(file, targetDevice: target);
-        if (mounted) {
-          _message('已发送');
-        }
-      } catch (exception) {
-        if (mounted) _message('快传失败：${controller.describeError(exception)}');
+    try {
+      final total = await controller.validateTransferSelection(files);
+      if (mounted) {
+        _message('已加入 ${files.length} 个文件，共 ${_formatBytes(total)}');
       }
+      final results = await Future.wait<String>([
+        for (final file in files) _sendQuickFile(file, target),
+      ]);
+      if (mounted) {
+        final succeeded = results.where((value) => value == 'sent').length;
+        final cancelled = results.where((value) => value == 'cancelled').length;
+        final failed = results.length - succeeded - cancelled;
+        final parts = <String>[
+          '成功 $succeeded 个',
+          if (failed > 0) '失败 $failed 个',
+          if (cancelled > 0) '取消 $cancelled 个',
+        ];
+        _message('本批次已结束：${parts.join('，')}');
+      }
+    } catch (exception) {
+      if (mounted) _message(controller.describeError(exception));
+    }
+  }
+
+  Future<void> _retryTask(TransferTask task) async {
+    try {
+      await controller.retryTask(task);
+      if (mounted && task.status == TransferStatus.completed) {
+        _message('重试成功：${task.name}');
+      }
+    } catch (exception) {
+      if (mounted) _message('重试失败：${controller.describeError(exception)}');
+    }
+  }
+
+  Future<String> _sendQuickFile(File file, String target) async {
+    try {
+      await controller.publishQuickTransfer(file, targetDevice: target);
+      return 'sent';
+    } on TransferCancelled {
+      return 'cancelled';
+    } catch (exception) {
+      return 'failed';
     }
   }
 
@@ -905,37 +1082,21 @@ class _RepositoryPageState extends State<RepositoryPage>
               mimeType: mimeType,
             );
       if (!isMedia && documentTarget == null) return;
-      final temporary = await getTemporaryDirectory();
+      final temporary = await getApplicationSupportDirectory();
       final target = File(
-        '${temporary.path}${Platform.pathSeparator}${manifest.name}',
+        '${temporary.path}${Platform.pathSeparator}${manifest.id}-${manifest.name}',
       );
       try {
         await controller.receiveQuickTransfer(
           manifest,
           target: target,
-          finalize: false,
+          androidTargetUri: documentTarget,
+          saveAsMedia: isMedia,
+          mimeType: mimeType,
         );
-        if (!mounted) return;
-        final saved = isMedia
-            ? await AndroidSaveFile.saveMedia(
-                source: target,
-                suggestedName: manifest.name,
-                mimeType: mimeType,
-              )
-            : await AndroidSaveFile.saveToDocumentTarget(
-                source: target,
-                targetUri: documentTarget!,
-              );
-        if (saved) {
-          await controller.markQuickTransferClaimed(manifest);
-          if (mounted) _message('文件已保存');
-        } else if (mounted) {
-          _message('已取消保存');
-        }
+        if (mounted) _message('文件已保存');
       } catch (exception) {
         if (mounted) _message('领取失败：${controller.describeError(exception)}');
-      } finally {
-        if (await target.exists()) await target.delete();
       }
       return;
     }
@@ -991,7 +1152,8 @@ class _RepositoryPageState extends State<RepositoryPage>
               Icon(
                 task.direction == TransferDirection.upload
                     ? Icons.upload_outlined
-                    : task.direction == TransferDirection.quickDrop
+                    : task.direction == TransferDirection.quickSend ||
+                          task.direction == TransferDirection.quickReceive
                     ? Icons.bolt_outlined
                     : Icons.download_outlined,
               ),
@@ -1024,22 +1186,27 @@ class _RepositoryPageState extends State<RepositoryPage>
           const SizedBox(height: 6),
           Align(
             alignment: Alignment.centerRight,
-            child: task.status == TransferStatus.running
+            child: task.status == TransferStatus.finalizing
+                ? const Text('正在安全保存，请稍候…')
+                : task.status == TransferStatus.running ||
+                      task.status == TransferStatus.queued
                 ? Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      OutlinedButton.icon(
-                        onPressed: task.isPaused
-                            ? () => controller.resumeTask(task)
-                            : () => controller.pauseTask(task),
-                        icon: Icon(
-                          task.isPaused
-                              ? Icons.play_arrow_outlined
-                              : Icons.pause_outlined,
+                      if (task.status == TransferStatus.running) ...[
+                        OutlinedButton.icon(
+                          onPressed: task.isPaused
+                              ? () => controller.resumeTask(task)
+                              : () => controller.pauseTask(task),
+                          icon: Icon(
+                            task.isPaused
+                                ? Icons.play_arrow_outlined
+                                : Icons.pause_outlined,
+                          ),
+                          label: Text(task.isPaused ? '继续' : '暂停'),
                         ),
-                        label: Text(task.isPaused ? '继续' : '暂停'),
-                      ),
-                      const SizedBox(width: 8),
+                        const SizedBox(width: 8),
+                      ],
                       OutlinedButton.icon(
                         onPressed: () => controller.cancelTask(task),
                         icon: const Icon(Icons.cancel_outlined),
@@ -1047,10 +1214,24 @@ class _RepositoryPageState extends State<RepositoryPage>
                       ),
                     ],
                   )
-                : TextButton.icon(
-                    onPressed: () => controller.removeTask(task),
-                    icon: const Icon(Icons.delete_outline),
-                    label: const Text('移除任务'),
+                : Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (task.status == TransferStatus.failed &&
+                          controller.canRetryTask(task)) ...[
+                        FilledButton.icon(
+                          onPressed: () => _retryTask(task),
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('重试'),
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      TextButton.icon(
+                        onPressed: () => controller.removeTask(task),
+                        icon: const Icon(Icons.delete_outline),
+                        label: const Text('移除任务'),
+                      ),
+                    ],
                   ),
           ),
         ],
@@ -1094,11 +1275,23 @@ class _RepositoryPageState extends State<RepositoryPage>
 
   Future<void> _prepareUpload(List<File> files) async {
     if (files.isEmpty || !mounted) return;
+    try {
+      final total = await controller.validateTransferSelection(files);
+      if (mounted) {
+        _message('已选择 ${files.length} 个文件，共 ${_formatBytes(total)}');
+      }
+    } catch (exception) {
+      if (mounted) _message(controller.describeError(exception));
+      return;
+    }
+    if (!mounted) return;
     final existing = controller.entries
         .map((entry) => entry.name.toLowerCase())
         .toSet();
     final conflict = files.any(
-      (file) => existing.contains(file.uri.pathSegments.last.toLowerCase()),
+      (file) => existing.contains(
+        sanitizeTransferFileName(file.uri.pathSegments.last).toLowerCase(),
+      ),
     );
     var overwrite = true;
     var keepBoth = false;
@@ -1111,11 +1304,15 @@ class _RepositoryPageState extends State<RepositoryPage>
       overwrite = choice == 'overwrite';
       keepBoth = choice == 'keep';
     }
-    await controller.uploadFiles(
-      files,
-      overwrite: overwrite,
-      keepBoth: keepBoth,
-    );
+    try {
+      await controller.uploadFiles(
+        files,
+        overwrite: overwrite,
+        keepBoth: keepBoth,
+      );
+    } catch (exception) {
+      if (mounted) _message('上传失败：${controller.describeError(exception)}');
+    }
   }
 
   Future<void> _cleanMaterializedUploads() async {
@@ -1170,7 +1367,11 @@ class _RepositoryPageState extends State<RepositoryPage>
       ),
     );
     if (name != null && name.trim().isNotEmpty) {
-      await controller.createDirectory(name.trim());
+      try {
+        await controller.createDirectory(name.trim());
+      } catch (exception) {
+        if (mounted) _message(controller.describeError(exception));
+      }
     }
   }
 
@@ -1181,26 +1382,31 @@ class _RepositoryPageState extends State<RepositoryPage>
         mimeType: _mimeType(entry.name),
       );
       if (documentTarget == null) return;
-      final temp = await getTemporaryDirectory();
+      final temp = await getApplicationSupportDirectory();
       final target = File(
-        '${temp.path}${Platform.pathSeparator}${DateTime.now().microsecondsSinceEpoch}-${entry.name}',
+        '${temp.path}${Platform.pathSeparator}${uniqueSuffix()}-${entry.name}',
       );
       try {
-        await controller.downloadFile(entry, target);
-        if (!mounted) return;
-        final saved = await AndroidSaveFile.saveToDocumentTarget(
-          source: target,
-          targetUri: documentTarget,
+        await controller.downloadFile(
+          entry,
+          target,
+          deleteTargetOnCancel: true,
+          androidTargetUri: documentTarget,
         );
-        if (mounted) _message(saved ? '文件已保存' : '已取消保存');
-      } finally {
-        if (await target.exists()) await target.delete();
+        if (mounted) _message('文件已保存');
+      } catch (exception) {
+        if (mounted) _message('下载失败：${controller.describeError(exception)}');
       }
       return;
     }
     final location = await getSaveLocation(suggestedName: entry.name);
     if (location == null) return;
-    await controller.downloadFile(entry, File(location.path));
+    try {
+      await controller.downloadFile(entry, File(location.path));
+      if (mounted) _message('文件已保存');
+    } catch (exception) {
+      if (mounted) _message('下载失败：${controller.describeError(exception)}');
+    }
   }
 
   Future<void> _preview(FileEntry entry) async {
@@ -1208,7 +1414,60 @@ class _RepositoryPageState extends State<RepositoryPage>
       _message('请下载后使用系统应用打开');
       return;
     }
-    final file = await controller.previewFile(entry);
+    final image = _isImage(entry.name);
+    final limit = image ? 50 * 1024 * 1024 : 1024 * 1024;
+    if (entry.size > limit) {
+      _message(image ? '图片过大，请下载后查看' : '文本超过 1 MB，请下载后查看');
+      return;
+    }
+    var loadingOpen = true;
+    var cancelled = false;
+    final previewControl = TransferControl();
+    final future = controller.previewFile(entry, control: previewControl);
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => AlertDialog(
+          content: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              SizedBox(width: 16),
+              Text('正在准备预览…'),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                cancelled = true;
+                loadingOpen = false;
+                unawaited(previewControl.cancel());
+                Navigator.pop(dialogContext);
+              },
+              child: const Text('取消'),
+            ),
+          ],
+        ),
+      ),
+    );
+    late final File file;
+    try {
+      file = await future;
+    } catch (exception) {
+      if (mounted && loadingOpen) Navigator.of(context).pop();
+      if (mounted && !cancelled) _message(controller.describeError(exception));
+      return;
+    }
+    if (mounted && loadingOpen) Navigator.of(context).pop();
+    if (cancelled) {
+      await controller.releasePreview(file);
+      return;
+    }
     if (!mounted) return;
     try {
       await showDialog<void>(
@@ -1221,6 +1480,11 @@ class _RepositoryPageState extends State<RepositoryPage>
   }
 
   Future<void> _showConnectionDialog() async {
+    if (controller.isLoading) return;
+    if (controller.hasActiveTransfers) {
+      _message('有任务正在传输，请完成或取消后再更改连接');
+      return;
+    }
     final local = TextEditingController(text: controller.localRoot);
     final host = TextEditingController(
       text: controller.sftpProfile?.host ?? '',
@@ -1320,18 +1584,22 @@ class _RepositoryPageState extends State<RepositoryPage>
       ),
     );
     if (save != true) return;
-    if (selectedMode == RepositoryMode.local) {
-      await controller.configureLocalRoot(local.text.trim());
-    } else {
-      await controller.configureSftp(
-        SftpConnectionProfile(
-          host: host.text.trim(),
-          port: int.tryParse(port.text.trim()) ?? 2022,
-          username: username.text.trim(),
-          password: password.text,
-          hostKeyFingerprint: fingerprint.text.trim(),
-        ),
-      );
+    try {
+      if (selectedMode == RepositoryMode.local) {
+        await controller.configureLocalRoot(local.text.trim());
+      } else {
+        await controller.configureSftp(
+          SftpConnectionProfile(
+            host: host.text.trim(),
+            port: int.tryParse(port.text.trim()) ?? 2022,
+            username: username.text.trim(),
+            password: password.text,
+            hostKeyFingerprint: fingerprint.text.trim(),
+          ),
+        );
+      }
+    } catch (exception) {
+      if (mounted) _message(controller.describeError(exception));
     }
   }
 
@@ -1380,11 +1648,27 @@ class _PreviewDialog extends StatelessWidget {
               const Divider(),
               Expanded(
                 child: image
-                    ? InteractiveViewer(child: Center(child: Image.file(file)))
+                    ? InteractiveViewer(
+                        child: Center(
+                          child: Image.file(
+                            file,
+                            cacheWidth:
+                                (MediaQuery.sizeOf(context).width *
+                                        MediaQuery.devicePixelRatioOf(context))
+                                    .round()
+                                    .clamp(800, 4096),
+                            errorBuilder: (_, _, _) => const Text('图片无法预览'),
+                          ),
+                        ),
+                      )
                     : FutureBuilder<String>(
                         future: _readText(file),
                         builder: (context, snapshot) => SingleChildScrollView(
-                          child: SelectableText(snapshot.data ?? '正在读取...'),
+                          child: SelectableText(
+                            snapshot.hasError
+                                ? '无法预览：文件不是有效文本或已损坏。'
+                                : snapshot.data ?? '正在读取...',
+                          ),
                         ),
                       ),
               ),
@@ -1467,6 +1751,7 @@ String _formatDate(DateTime value) =>
 String _statusLabel(TransferStatus status) => switch (status) {
   TransferStatus.queued => '等待中',
   TransferStatus.running => '传输中',
+  TransferStatus.finalizing => '正在完成',
   TransferStatus.completed => '已完成',
   TransferStatus.failed => '失败',
   TransferStatus.cancelled => '已取消',

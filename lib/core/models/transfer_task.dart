@@ -1,6 +1,13 @@
-enum TransferDirection { upload, download, quickDrop }
+enum TransferDirection { upload, download, quickSend, quickReceive }
 
-enum TransferStatus { queued, running, completed, failed, cancelled }
+enum TransferStatus {
+  queued,
+  running,
+  finalizing,
+  completed,
+  failed,
+  cancelled,
+}
 
 class TransferTask {
   TransferTask({
