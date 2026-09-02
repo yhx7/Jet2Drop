@@ -638,18 +638,16 @@ class _RepositoryPageState extends State<RepositoryPage>
         children: [
           Text('传输任务', style: Theme.of(context).textTheme.titleLarge),
           const Spacer(),
-          TextButton.icon(
-            onPressed:
-                controller.tasks.any(
-                  (task) =>
-                      task.status == TransferStatus.completed ||
-                      task.status == TransferStatus.cancelled,
-                )
-                ? controller.clearFinishedTasks
-                : null,
-            icon: const Icon(Icons.cleaning_services_outlined),
-            label: const Text('清理已结束'),
-          ),
+          if (controller.tasks.any(
+            (task) =>
+                task.status == TransferStatus.completed ||
+                task.status == TransferStatus.cancelled,
+          ))
+            TextButton.icon(
+              onPressed: controller.clearFinishedTasks,
+              icon: const Icon(Icons.cleaning_services_outlined),
+              label: const Text('清除已完成任务'),
+            ),
         ],
       ),
       const SizedBox(height: 12),

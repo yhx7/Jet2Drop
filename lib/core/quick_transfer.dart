@@ -99,6 +99,31 @@ class QuickTransferService {
 
   final int chunkSize;
 
+  QuickTransferManifest describe(
+    File source, {
+    required int size,
+    required String checksum,
+    Duration ttl = const Duration(hours: 24),
+    String senderDevice = '',
+    String targetDevice = '',
+    String? transferId,
+  }) {
+    final now = DateTime.now().toUtc();
+    return QuickTransferManifest(
+      id:
+          transferId ??
+          '${DateTime.now().microsecondsSinceEpoch}-${_safeName(source)}',
+      name: sanitizeTransferFileName(source.uri.pathSegments.last),
+      size: size,
+      sha256: checksum,
+      createdAt: now,
+      expiresAt: now.add(ttl),
+      chunkSize: size > 32 * 1024 * 1024 ? chunkSize : size,
+      senderDevice: senderDevice,
+      targetDevice: targetDevice,
+    );
+  }
+
   Future<QuickTransferManifest> inspect(
     File source, {
     Duration ttl = const Duration(hours: 24),
@@ -117,19 +142,14 @@ class QuickTransferService {
       onProgress?.call(read, total);
     }
     hashing.close();
-    final now = DateTime.now().toUtc();
-    return QuickTransferManifest(
-      id:
-          transferId ??
-          '${DateTime.now().microsecondsSinceEpoch}-${_safeName(source)}',
-      name: sanitizeTransferFileName(source.uri.pathSegments.last),
+    return describe(
+      source,
       size: total,
-      sha256: digest.value!.toString(),
-      createdAt: now,
-      expiresAt: now.add(ttl),
-      chunkSize: total > 32 * 1024 * 1024 ? chunkSize : total,
+      checksum: digest.value!.toString(),
+      ttl: ttl,
       senderDevice: senderDevice,
       targetDevice: targetDevice,
+      transferId: transferId,
     );
   }
 

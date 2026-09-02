@@ -425,6 +425,62 @@ void main() {
     );
   });
 
+  test(
+    'claimed quick records delete once without stale refresh reappearing',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-quick-delete-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final source = File('${root.path}${Platform.pathSeparator}payload.bin');
+      await source.writeAsBytes(List<int>.generate(256 * 1024, (i) => i % 251));
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final senderId = controller.deviceId;
+      const targetId = 'target-device';
+      controller.quickDevices = [
+        QuickDevice(id: targetId, name: '接收设备', updatedAt: DateTime.now()),
+      ];
+      final manifest = await controller.publishQuickTransfer(
+        source,
+        targetDevice: targetId,
+      );
+      controller.deviceId = targetId;
+      controller.quickDevices = [
+        QuickDevice(id: senderId, name: '发送设备', updatedAt: DateTime.now()),
+      ];
+      await controller.refreshQuickTransfer(refreshDevices: true);
+      final target = File('${root.path}${Platform.pathSeparator}received.bin');
+      await controller.receiveQuickTransfer(manifest, target: target);
+      final claimed = controller.quickInbox.singleWhere(
+        (item) => item.id == manifest.id,
+      );
+
+      await Future.wait([
+        controller.deleteQuickTransfer(claimed),
+        for (var attempt = 0; attempt < 8; attempt++)
+          controller.refreshQuickTransfer(),
+      ]);
+      await controller.deleteQuickTransfer(claimed);
+      await controller.refreshQuickTransfer();
+
+      expect(controller.quickError, isNull);
+      expect(
+        controller.quickInbox.any((item) => item.id == manifest.id),
+        isFalse,
+      );
+      expect(
+        await Directory(
+          '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+          '${Platform.pathSeparator}messages${Platform.pathSeparator}${manifest.id}',
+        ).exists(),
+        isFalse,
+      );
+    },
+  );
+
   test('quick recipients contain only other recently seen devices', () async {
     final controller = AppController()..deviceId = 'self';
     addTearDown(controller.dispose);

@@ -48,6 +48,7 @@ class SerializedRepositoryGateway implements RepositoryGateway {
     required bool overwrite,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   }) => _run(
     () => _delegate.uploadFile(
@@ -57,6 +58,7 @@ class SerializedRepositoryGateway implements RepositoryGateway {
       overwrite: overwrite,
       resumeId: resumeId,
       onProgress: onProgress,
+      onChecksum: onChecksum,
       control: control,
     ),
   );

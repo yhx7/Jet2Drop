@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:crypto/crypto.dart';
 import 'package:jet2drop/core/path_utils.dart';
 import 'package:jet2drop/core/quick_transfer.dart';
 import 'package:jet2drop/core/connection_retry.dart';
@@ -188,6 +189,7 @@ void main() {
     );
     await partial.writeAsBytes(bytes.take(8192).toList());
     var firstProgress = -1;
+    String? uploadedChecksum;
     await gateway.uploadFile(
       source: source,
       targetDirectory: '',
@@ -197,8 +199,10 @@ void main() {
       onProgress: (current, _) {
         if (firstProgress < 0) firstProgress = current;
       },
+      onChecksum: (value) => uploadedChecksum = value,
     );
     expect(firstProgress, 8192);
+    expect(uploadedChecksum, sha256.convert(bytes).toString());
     expect(
       await File(
         '${root.path}${Platform.pathSeparator}result.bin',

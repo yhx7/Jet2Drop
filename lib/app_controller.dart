@@ -94,6 +94,7 @@ class AppController extends ChangeNotifier {
   Timer? _quickMaintenanceTimer;
   DateTime? _lastQuickDeviceRefresh;
   final Map<String, QuickTransferManifest> _quickManifestCache = {};
+  final Set<String> _hiddenQuickTransferIds = {};
   final Map<String, ({DateTime modifiedAt, QuickDevice device})>
   _quickDeviceCache = {};
   String deviceId = '';
@@ -978,8 +979,9 @@ class AppController extends ChangeNotifier {
                 ),
               );
               _quickManifestCache.remove(manifestPath);
-            } else if (value.senderDevice == deviceId ||
-                value.targetDevice == deviceId) {
+            } else if (!_hiddenQuickTransferIds.contains(value.id) &&
+                (value.senderDevice == deviceId ||
+                    value.targetDevice == deviceId)) {
               inbox.add(value);
             }
           } catch (_) {
@@ -1634,29 +1636,9 @@ class AppController extends ChangeNotifier {
         '${support.path}${Platform.pathSeparator}quick-transfer-staging${Platform.pathSeparator}${uniqueSuffix()}',
       );
       await staging.create(recursive: true);
-      final manifest = await quickTransfer.inspect(
-        source,
-        senderDevice: deviceId,
-        targetDevice: targetDevice,
-        transferId: task.id,
-        onProgress: (current, total) {
-          // Local staging is preparation, not network transfer. Keep it in a
-          // small initial range so the visible progress reflects upload work.
-          task.transferredBytes = total == 0
-              ? 0
-              : (task.totalBytes * current ~/ total ~/ 20);
-          _notifyTransferProgress();
-        },
-      );
-      final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
-      await _ensureDirectory('$_quickRoot/$_quickMessages', manifest.id);
-      final manifestFile = File(
-        '${staging.path}${Platform.pathSeparator}${manifest.id}.json',
-      );
-      await manifestFile.writeAsString(
-        jsonEncode(manifest.toJson()),
-        flush: true,
-      );
+      final remotePackage = '$_quickRoot/$_quickMessages/${task.id}';
+      await _ensureDirectory('$_quickRoot/$_quickMessages', task.id);
+      String? checksum;
       await _retryOperation(
         () => _gateway!.uploadFile(
           source: source,
@@ -1665,14 +1647,29 @@ class AppController extends ChangeNotifier {
           overwrite: true,
           resumeId: task.id,
           control: control,
+          onChecksum: (value) => checksum = value,
           onProgress: (current, total) {
             task.transferredBytes = total == 0
-                ? task.totalBytes ~/ 20
-                : task.totalBytes ~/ 20 +
-                      ((task.totalBytes * 93 ~/ 100) * current ~/ total);
+                ? 0
+                : (task.totalBytes * 98 ~/ 100) * current ~/ total;
             _notifyTransferProgress();
           },
         ),
+      );
+      final manifest = quickTransfer.describe(
+        source,
+        size: task.totalBytes,
+        checksum: checksum ?? (throw StateError('Upload checksum is missing.')),
+        senderDevice: deviceId,
+        targetDevice: targetDevice,
+        transferId: task.id,
+      );
+      final manifestFile = File(
+        '${staging.path}${Platform.pathSeparator}${manifest.id}.json',
+      );
+      await manifestFile.writeAsString(
+        jsonEncode(manifest.toJson()),
+        flush: true,
       );
       await control.checkpoint();
       task.status = TransferStatus.finalizing;
@@ -1932,24 +1929,44 @@ class AppController extends ChangeNotifier {
       throw StateError('This device is not a participant in the transfer.');
     }
     final previous = quickInbox;
+    _hiddenQuickTransferIds.add(manifest.id);
+    _quickRefreshGeneration++;
     quickInbox = previous
         .where((item) => item.id != manifest.id)
         .toList(growable: false);
     notifyListeners();
+    final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
     try {
       await _resetConnection();
-      await _retryOperation(
-        () => _gateway!.deleteEntry(
-          '$_quickRoot/$_quickMessages/${manifest.id}',
-          recursive: true,
-        ),
-      );
+      try {
+        await _retryOperation(
+          () => _gateway!.deleteEntry(messagePath, recursive: true),
+        );
+      } catch (exception, stackTrace) {
+        var stillExists = true;
+        try {
+          final packages = await _retryOperation(
+            () => _gateway!.listDirectory('$_quickRoot/$_quickMessages'),
+          );
+          stillExists = packages.any(
+            (entry) => entry.isDirectory && entry.name == manifest.id,
+          );
+        } catch (_) {
+          Error.throwWithStackTrace(exception, stackTrace);
+        }
+        if (stillExists) Error.throwWithStackTrace(exception, stackTrace);
+      }
+      _quickManifestCache.remove('$messagePath/manifest.json');
       await refreshQuickTransfer();
     } catch (_) {
+      _hiddenQuickTransferIds.remove(manifest.id);
       quickInbox = previous;
       notifyListeners();
       rethrow;
     }
+    _hiddenQuickTransferIds.remove(manifest.id);
+    quickError = null;
+    notifyListeners();
   }
 
   Future<void> _resetConnection() async {

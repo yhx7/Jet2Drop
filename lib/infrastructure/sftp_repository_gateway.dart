@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 
 import '../core/models/file_entry.dart';
+import '../core/checksum.dart';
 import '../core/path_utils.dart';
 import '../core/repository_gateway.dart';
 import '../core/transfer_control.dart';
@@ -236,6 +237,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
     required bool overwrite,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   }) async {
     final cleanName = normalizeRelativePath(targetName);
@@ -273,6 +275,12 @@ class SftpRepositoryGateway implements RepositoryGateway {
       'Preparing upload',
     );
     try {
+      final checksum = onChecksum == null ? null : Sha256Accumulator();
+      if (checksum != null && offset > 0) {
+        await for (final chunk in source.openRead(0, offset)) {
+          checksum.add(chunk);
+        }
+      }
       Timer? inactivityTimer;
       final inactivity = Completer<void>();
       void resetInactivityTimer() {
@@ -291,7 +299,8 @@ class SftpRepositoryGateway implements RepositoryGateway {
       final writer = handle.write(
         source.openRead(offset).asyncExpand((chunk) async* {
           await control?.checkpoint();
-          yield Uint8List.fromList(chunk);
+          checksum?.add(chunk);
+          yield chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
         }),
         onProgress: (value) {
           resetInactivityTimer();
@@ -313,6 +322,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
       }
       await control?.checkpoint();
       await _withOperationTimeout(handle.close(), 'Finalizing upload');
+      if (checksum != null) onChecksum!(checksum.close());
       var destinationExists = false;
       try {
         await sftp.stat(destination);

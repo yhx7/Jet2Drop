@@ -75,7 +75,7 @@ void main() {
     await tester.tap(find.text('任务').last);
     await tester.pump();
     expect(find.text('传输任务'), findsOneWidget);
-    expect(find.text('清理已结束'), findsOneWidget);
+    expect(find.text('清除已完成任务'), findsNothing);
   });
 
   testWidgets('quick transfer updates in place after connection succeeds', (
@@ -228,7 +228,7 @@ void main() {
     expect(find.text('移除任务'), findsNWidgets(2));
     expect(
       tester
-          .widget<TextButton>(find.widgetWithText(TextButton, '清理已结束'))
+          .widget<TextButton>(find.widgetWithText(TextButton, '清除已完成任务'))
           .onPressed,
       isNotNull,
     );

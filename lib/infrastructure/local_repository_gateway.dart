@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import '../core/models/file_entry.dart';
+import '../core/checksum.dart';
 import '../core/path_utils.dart';
 import '../core/repository_gateway.dart';
 import '../core/transfer_control.dart';
@@ -144,6 +145,7 @@ class LocalRepositoryGateway implements RepositoryGateway {
     required bool overwrite,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   }) async {
     final destinationDirectory = _directoryFor(targetDirectory);
@@ -176,16 +178,24 @@ class LocalRepositoryGateway implements RepositoryGateway {
     final sink = temp.openWrite(
       mode: written == 0 ? FileMode.write : FileMode.append,
     );
+    final checksum = onChecksum == null ? null : Sha256Accumulator();
     try {
+      if (checksum != null && written > 0) {
+        await for (final chunk in source.openRead(0, written)) {
+          checksum.add(chunk);
+        }
+      }
       onProgress?.call(written, total);
       await for (final chunk in source.openRead(written)) {
         await control?.checkpoint();
+        checksum?.add(chunk);
         sink.add(chunk);
         written += chunk.length;
         onProgress?.call(written, total);
       }
       await sink.flush();
       await sink.close();
+      if (checksum != null) onChecksum!(checksum.close());
       final backup = File(
         '${destination.path}.jet2drop-backup-${uniqueSuffix()}',
       );

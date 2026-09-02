@@ -4,6 +4,7 @@ import 'models/file_entry.dart';
 import 'transfer_control.dart';
 
 typedef ProgressCallback = void Function(int transferred, int total);
+typedef ChecksumCallback = void Function(String checksum);
 
 abstract interface class RepositoryGateway {
   Future<void> initialize();
@@ -19,6 +20,7 @@ abstract interface class RepositoryGateway {
     required bool overwrite,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   });
   Future<void> discardUploadPartial({
