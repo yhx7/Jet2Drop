@@ -36,6 +36,11 @@ class TransferForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            // A very small transfer can finish before Android has delivered the
+            // preceding ACTION_START.  Enter the foreground even in that case
+            // before stopping, so the startForegroundService contract is
+            // always fulfilled and Android does not terminate the app.
+            startForeground(NOTIFICATION_ID, notification(0, 0, 1))
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY

@@ -308,7 +308,13 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                     "stop" -> {
-                        stopService(Intent(this, TransferForegroundService::class.java))
+                        // Queue an explicit stop command instead of cancelling
+                        // the service before its first onStartCommand.  The
+                        // latter races with fast photo transfers and causes
+                        // ForegroundServiceDidNotStartInTimeException.
+                        startService(Intent(this, TransferForegroundService::class.java).apply {
+                            action = TransferForegroundService.ACTION_STOP
+                        })
                         result.success(true)
                     }
                     else -> result.notImplemented()
