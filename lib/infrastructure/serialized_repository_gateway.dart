@@ -82,6 +82,7 @@ class SerializedRepositoryGateway implements RepositoryGateway {
     required File target,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   }) => _run(
     () => _delegate.downloadFile(
@@ -89,6 +90,7 @@ class SerializedRepositoryGateway implements RepositoryGateway {
       target: target,
       resumeId: resumeId,
       onProgress: onProgress,
+      onChecksum: onChecksum,
       control: control,
     ),
   );

@@ -103,6 +103,7 @@ class QuickTransferService {
     File source, {
     required int size,
     required String checksum,
+    String? name,
     Duration ttl = const Duration(hours: 24),
     String senderDevice = '',
     String targetDevice = '',
@@ -113,7 +114,7 @@ class QuickTransferService {
       id:
           transferId ??
           '${DateTime.now().microsecondsSinceEpoch}-${_safeName(source)}',
-      name: sanitizeTransferFileName(source.uri.pathSegments.last),
+      name: sanitizeTransferFileName(name ?? source.uri.pathSegments.last),
       size: size,
       sha256: checksum,
       createdAt: now,
@@ -151,6 +152,16 @@ class QuickTransferService {
       targetDevice: targetDevice,
       transferId: transferId,
     );
+  }
+
+  Future<String> checksum(File source) async {
+    final digest = _DigestSink();
+    final hashing = sha256.startChunkedConversion(digest);
+    await for (final chunk in source.openRead()) {
+      hashing.add(chunk);
+    }
+    hashing.close();
+    return digest.value!.toString();
   }
 
   Future<QuickTransferManifest> publish(
@@ -271,20 +282,27 @@ class QuickTransferService {
     File payload,
     File target, {
     void Function(int current, int total)? onProgress,
+    String? verifiedChecksum,
+    int? verifiedSize,
   }) async {
     if (!await payload.exists()) {
       throw StateError('Transfer payload is missing');
     }
-    var read = 0;
-    final digest = _DigestSink();
-    final hashing = sha256.startChunkedConversion(digest);
-    await for (final chunk in payload.openRead()) {
-      hashing.add(chunk);
-      read += chunk.length;
-      onProgress?.call(read, manifest.size);
+    var read = verifiedSize;
+    var checksum = verifiedChecksum;
+    if (read == null || checksum == null) {
+      read = 0;
+      final digest = _DigestSink();
+      final hashing = sha256.startChunkedConversion(digest);
+      await for (final chunk in payload.openRead()) {
+        hashing.add(chunk);
+        read = read! + chunk.length;
+        onProgress?.call(read, manifest.size);
+      }
+      hashing.close();
+      checksum = digest.value?.toString();
     }
-    hashing.close();
-    if (read != manifest.size || digest.value!.toString() != manifest.sha256) {
+    if (read != manifest.size || checksum != manifest.sha256) {
       throw StateError('Transfer checksum verification failed');
     }
     await target.parent.create(recursive: true);

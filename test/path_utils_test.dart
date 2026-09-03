@@ -70,8 +70,14 @@ void main() {
     );
     expect((await gateway.listDirectory('docs')).single.name, 'report.bin');
     final target = File('${root.path}/downloaded.bin');
-    await gateway.downloadFile(remotePath: 'docs/report.bin', target: target);
+    String? downloadedChecksum;
+    await gateway.downloadFile(
+      remotePath: 'docs/report.bin',
+      target: target,
+      onChecksum: (value) => downloadedChecksum = value,
+    );
     expect(await target.readAsBytes(), [10, 20, 30, 40]);
+    expect(downloadedChecksum, sha256.convert([10, 20, 30, 40]).toString());
     await expectLater(
       () => gateway.uploadFile(
         source: source,
@@ -90,6 +96,34 @@ void main() {
       throwsArgumentError,
     );
     expect(() => gateway.listDirectory('../outside'), throwsArgumentError);
+  });
+
+  test('resumed download checksum covers the bytes already on disk', () async {
+    final root = await Directory.systemTemp.createTemp('jet2drop-resume-hash-');
+    addTearDown(() => root.delete(recursive: true));
+    final gateway = LocalRepositoryGateway(root.path);
+    await gateway.initialize();
+    addTearDown(gateway.dispose);
+    await File(
+      '${root.path}${Platform.pathSeparator}source.bin',
+    ).writeAsBytes([1, 2, 3, 4]);
+    final target = File('${root.path}${Platform.pathSeparator}target.bin');
+    const resumeId = 'resume-checksum';
+    await File(
+      '${target.path}.jet2drop-download-$resumeId.part',
+    ).writeAsBytes([9, 9]);
+    String? checksum;
+
+    await gateway.downloadFile(
+      remotePath: 'source.bin',
+      target: target,
+      resumeId: resumeId,
+      onChecksum: (value) => checksum = value,
+    );
+
+    expect(await target.readAsBytes(), [9, 9, 3, 4]);
+    expect(checksum, sha256.convert([9, 9, 3, 4]).toString());
+    expect(checksum, isNot(sha256.convert([1, 2, 3, 4]).toString()));
   });
 
   test(

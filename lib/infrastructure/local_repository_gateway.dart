@@ -181,7 +181,7 @@ class LocalRepositoryGateway implements RepositoryGateway {
     final checksum = onChecksum == null ? null : Sha256Accumulator();
     try {
       if (checksum != null && written > 0) {
-        await for (final chunk in source.openRead(0, written)) {
+        await for (final chunk in temp.openRead(0, written)) {
           checksum.add(chunk);
         }
       }
@@ -250,6 +250,7 @@ class LocalRepositoryGateway implements RepositoryGateway {
     required File target,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   }) async {
     final source = File(_entityFor(remotePath).path);
@@ -272,16 +273,24 @@ class LocalRepositoryGateway implements RepositoryGateway {
     final sink = temp.openWrite(
       mode: written == 0 ? FileMode.write : FileMode.append,
     );
+    final checksum = onChecksum == null ? null : Sha256Accumulator();
     try {
+      if (checksum != null && written > 0) {
+        await for (final chunk in temp.openRead(0, written)) {
+          checksum.add(chunk);
+        }
+      }
       onProgress?.call(written, total);
       await for (final chunk in source.openRead(written)) {
         await control?.checkpoint();
+        checksum?.add(chunk);
         sink.add(chunk);
         written += chunk.length;
         onProgress?.call(written, total);
       }
       await sink.flush();
       await sink.close();
+      if (checksum != null) onChecksum!(checksum.close());
       final backup = File('${target.path}.jet2drop-backup-${uniqueSuffix()}');
       final hadTarget = await target.exists();
       if (hadTarget) await target.rename(backup.path);

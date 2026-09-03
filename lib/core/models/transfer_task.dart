@@ -18,6 +18,7 @@ class TransferTask {
     this.transferredBytes = 0,
     this.status = TransferStatus.queued,
     this.error,
+    this.supportsPause = true,
   });
 
   final String id;
@@ -27,6 +28,7 @@ class TransferTask {
   int transferredBytes;
   TransferStatus status;
   String? error;
+  final bool supportsPause;
   bool cancelRequested = false;
   bool isPaused = false;
 

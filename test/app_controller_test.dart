@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:jet2drop/app_controller.dart';
 import 'package:jet2drop/core/models/quick_device.dart';
 import 'package:jet2drop/core/models/transfer_task.dart';
+import 'package:jet2drop/core/photo_transfer.dart';
 import 'package:jet2drop/core/transfer_control.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -49,6 +50,11 @@ void main() {
     ).writeAsBytes([1, 2, 3, 4]);
     final controller = await createController(repository);
     addTearDown(controller.dispose);
+    if (controller.entries.isEmpty) {
+      throw StateError(
+        'controller initialization failed: ${controller.error}; quick=${controller.quickError}',
+      );
+    }
     final entry = controller.entries.singleWhere(
       (item) => item.name == 'source.bin',
     );
@@ -74,6 +80,71 @@ void main() {
     expect(task.status, TransferStatus.completed);
     expect(saves, 2);
   });
+
+  test(
+    'quick receive directory is persisted and changed without fallback',
+    () async {
+      final root = await Directory.systemTemp.createTemp('jet2drop-save-dir-');
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      final firstSave = Directory(
+        '${root.path}${Platform.pathSeparator}first-save',
+      );
+      final secondSave = Directory(
+        '${root.path}${Platform.pathSeparator}second-save',
+      );
+      await repository.create();
+      await firstSave.create();
+      await secondSave.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+
+      expect(controller.defaultQuickSaveDirectory, isNull);
+      await controller.setDefaultQuickSaveDirectory(firstSave.path);
+      expect(controller.defaultQuickSaveDirectory, firstSave.path);
+      final firstTarget = await controller.defaultQuickReceiveTarget('照片.jpg');
+      expect(firstTarget.parent.path, firstSave.path);
+      final concurrentTarget = await controller.defaultQuickReceiveTarget(
+        '照片.jpg',
+      );
+      expect(concurrentTarget.path, isNot(firstTarget.path));
+      expect(concurrentTarget.uri.pathSegments.last, '照片 (2).jpg');
+      final preferences = await SharedPreferences.getInstance();
+      expect(preferences.getString('quick_save_directory'), firstSave.path);
+
+      await controller.setDefaultQuickSaveDirectory(secondSave.path);
+      expect(controller.defaultQuickSaveDirectory, secondSave.path);
+      // A task that already resolved its target keeps its original directory.
+      expect(firstTarget.parent.path, firstSave.path);
+      final secondTarget = await controller.defaultQuickReceiveTarget('照片.jpg');
+      expect(secondTarget.parent.path, secondSave.path);
+    },
+  );
+
+  test(
+    'quick receive directory rejects missing and non-writable targets',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-save-invalid-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final missing = '${root.path}${Platform.pathSeparator}missing';
+      await expectLater(
+        () => controller.setDefaultQuickSaveDirectory(missing),
+        throwsStateError,
+      );
+      final file = File('${root.path}${Platform.pathSeparator}not-a-folder');
+      await file.writeAsString('x');
+      await expectLater(
+        () => controller.setDefaultQuickSaveDirectory(file.path),
+        throwsStateError,
+      );
+    },
+  );
 
   test('sanitized duplicate selections never overwrite one another', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-names-');
@@ -426,6 +497,127 @@ void main() {
   });
 
   test(
+    'explicit photos use direct receive while other files keep relay flow',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-photo-route-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      final photos = Directory('${root.path}${Platform.pathSeparator}photos');
+      await repository.create();
+      await photos.create();
+      final server = PhotoTransferServer(
+        token: 'photo-route-token',
+        bindAddress: InternetAddress.loopbackIPv4,
+        endpointHost: InternetAddress.loopbackIPv4.address,
+        saveDirectoryProvider: () async => photos.path,
+      );
+      addTearDown(server.stop);
+      expect(await server.start(), isTrue);
+      final photo = File('${root.path}${Platform.pathSeparator}original.jpg');
+      await photo.writeAsBytes([1, 2, 3, 4]);
+      final controller = await HttpOverrides.runWithHttpOverrides(
+        () => createController(repository),
+        _RealHttpOverrides(),
+      );
+      addTearDown(controller.dispose);
+      controller.quickDevices = [
+        QuickDevice(
+          id: 'target-device',
+          name: '接收设备',
+          updatedAt: DateTime.now(),
+          photoEndpoint: server.endpoint,
+          photoToken: 'photo-route-token',
+        ),
+      ];
+
+      final direct = await controller.publishQuickTransfer(
+        photo,
+        targetDevice: 'target-device',
+        originalName: '手机原图.jpg',
+        mimeType: 'image/jpeg',
+        isPhoto: true,
+      );
+      expect(direct.name, '手机原图.jpg');
+      expect(
+        await File(
+          '${photos.path}${Platform.pathSeparator}手机原图.jpg',
+        ).readAsBytes(),
+        [1, 2, 3, 4],
+      );
+      expect(
+        Directory(
+          '${repository.path}${Platform.pathSeparator}__jet2drop_transfer${Platform.pathSeparator}messages',
+        ).listSync(),
+        isEmpty,
+      );
+      final directTask = controller.tasks.singleWhere(
+        (task) => task.id == direct.id,
+      );
+      expect(directTask.status, TransferStatus.completed);
+      expect(directTask.supportsPause, isFalse);
+
+      final otherPhoto = File('${root.path}${Platform.pathSeparator}other.jpg');
+      await otherPhoto.writeAsBytes([9, 8, 7]);
+      final relayed = await controller.publishQuickTransfer(
+        otherPhoto,
+        targetDevice: 'target-device',
+        originalName: 'other.jpg',
+        mimeType: 'image/jpeg',
+      );
+      expect(
+        await File(
+          '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+          '${Platform.pathSeparator}messages${Platform.pathSeparator}${relayed.id}'
+          '${Platform.pathSeparator}manifest.json',
+        ).exists(),
+        isTrue,
+      );
+    },
+  );
+
+  test('photo route requires matching image MIME and extension', () async {
+    final root = await Directory.systemTemp.createTemp('jet2drop-photo-type-');
+    addTearDown(() => root.delete(recursive: true));
+    final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+    await repository.create();
+    final source = File('${root.path}${Platform.pathSeparator}photo.jpg');
+    await source.writeAsBytes([1]);
+    final controller = await createController(repository);
+    addTearDown(controller.dispose);
+    controller.quickDevices = [
+      QuickDevice(
+        id: 'target-device',
+        name: '接收设备',
+        updatedAt: DateTime.now(),
+        photoEndpoint: 'http://127.0.0.1:1',
+        photoToken: 'photo-route-token',
+      ),
+    ];
+
+    await expectLater(
+      () => controller.publishQuickTransfer(
+        source,
+        targetDevice: 'target-device',
+        originalName: 'photo.jpg',
+        mimeType: 'video/mp4',
+        isPhoto: true,
+      ),
+      throwsStateError,
+    );
+    expect(controller.tasks, isEmpty);
+    expect(
+      isSupportedPhotoTransfer(name: 'photo.jpg', mimeType: 'image/jpeg'),
+      isTrue,
+    );
+    expect(
+      isSupportedPhotoTransfer(name: 'photo.jpg', mimeType: 'image/png'),
+      isFalse,
+    );
+  });
+
+  test(
     'claimed quick records delete once without stale refresh reappearing',
     () async {
       final root = await Directory.systemTemp.createTemp(
@@ -570,3 +762,5 @@ void main() {
     },
   );
 }
+
+class _RealHttpOverrides extends HttpOverrides {}

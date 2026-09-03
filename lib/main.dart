@@ -11,6 +11,7 @@ import 'app_controller.dart';
 import 'core/models/file_entry.dart';
 import 'core/models/transfer_task.dart';
 import 'core/path_utils.dart';
+import 'core/photo_transfer.dart';
 import 'core/quick_transfer.dart';
 import 'core/transfer_control.dart';
 import 'infrastructure/sftp_repository_gateway.dart';
@@ -683,7 +684,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       const SizedBox(height: 4),
-                      const Text('原文件传输，接收完成后自动校验并清理中转文件。'),
+                      const Text('照片直达默认目录，其他文件可靠中转并自动校验。'),
                     ],
                   ),
                 ),
@@ -997,17 +998,39 @@ class _RepositoryPageState extends State<RepositoryPage>
   }
 
   Future<void> _pickQuickMedia(String targetDevice) async {
-    final List<File> files;
+    final selections = <_QuickFileSelection>[];
     if (Platform.isAndroid) {
-      files = await AndroidMediaPicker.pickImagesAndVideos();
+      selections.addAll(
+        (await AndroidMediaPicker.pickImagesAndVideos()).map(
+          (item) => _QuickFileSelection(
+            file: item.file,
+            name: item.name,
+            mimeType: item.mimeType,
+          ),
+        ),
+      );
     } else {
-      files = (await ImagePicker().pickMultipleMedia())
-          .map((item) => File(item.path))
-          .toList();
+      selections.addAll(
+        (await ImagePicker().pickMultipleMedia()).map(
+          (item) => _QuickFileSelection(
+            file: File(item.path),
+            name: item.name,
+            mimeType: _mimeType(item.name),
+          ),
+        ),
+      );
     }
+    final files = selections.map((item) => item.file).toList(growable: false);
     if (files.isEmpty) return;
     try {
-      await _sendQuickFiles(files, targetDevice: targetDevice);
+      await _sendQuickFiles(
+        files,
+        targetDevice: targetDevice,
+        allowPhotoDirect: true,
+        metadata: {
+          for (final selection in selections) selection.file.path: selection,
+        },
+      );
     } finally {
       if (Platform.isAndroid) await AndroidMediaPicker.cleanup(files);
     }
@@ -1016,6 +1039,8 @@ class _RepositoryPageState extends State<RepositoryPage>
   Future<void> _sendQuickFiles(
     List<File> files, {
     required String targetDevice,
+    bool allowPhotoDirect = false,
+    Map<String, _QuickFileSelection>? metadata,
   }) async {
     final target = targetDevice;
     if (target.isEmpty) {
@@ -1028,7 +1053,13 @@ class _RepositoryPageState extends State<RepositoryPage>
         _message('已加入 ${files.length} 个文件，共 ${_formatBytes(total)}');
       }
       final results = await Future.wait<String>([
-        for (final file in files) _sendQuickFile(file, target),
+        for (final file in files)
+          _sendQuickFile(
+            file,
+            target,
+            allowPhotoDirect: allowPhotoDirect,
+            metadata: metadata?[file.path],
+          ),
       ]);
       if (mounted) {
         final succeeded = results.where((value) => value == 'sent').length;
@@ -1057,9 +1088,25 @@ class _RepositoryPageState extends State<RepositoryPage>
     }
   }
 
-  Future<String> _sendQuickFile(File file, String target) async {
+  Future<String> _sendQuickFile(
+    File file,
+    String target, {
+    bool allowPhotoDirect = false,
+    _QuickFileSelection? metadata,
+  }) async {
     try {
-      await controller.publishQuickTransfer(file, targetDevice: target);
+      final name = metadata?.name ?? file.uri.pathSegments.last;
+      final mimeType = metadata?.mimeType ?? _mimeType(name);
+      final isPhoto =
+          allowPhotoDirect &&
+          isSupportedPhotoTransfer(name: name, mimeType: mimeType);
+      await controller.publishQuickTransfer(
+        file,
+        targetDevice: target,
+        originalName: name,
+        mimeType: mimeType,
+        isPhoto: isPhoto,
+      );
       return 'sent';
     } on TransferCancelled {
       return 'cancelled';
@@ -1098,12 +1145,10 @@ class _RepositoryPageState extends State<RepositoryPage>
       }
       return;
     }
-    final location = await getSaveLocation(suggestedName: manifest.name);
-    if (location == null) return;
     try {
       await controller.receiveQuickTransfer(
         manifest,
-        target: File(location.path),
+        target: await controller.defaultQuickReceiveTarget(manifest.name),
       );
       if (mounted) _message('文件已保存');
     } catch (exception) {
@@ -1191,7 +1236,8 @@ class _RepositoryPageState extends State<RepositoryPage>
                 ? Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (task.status == TransferStatus.running) ...[
+                      if (task.status == TransferStatus.running &&
+                          task.supportsPause) ...[
                         OutlinedButton.icon(
                           onPressed: task.isPaused
                               ? () => controller.resumeTask(task)
@@ -1500,6 +1546,7 @@ class _RepositoryPageState extends State<RepositoryPage>
       text: controller.sftpProfile?.hostKeyFingerprint ?? '',
     );
     var selectedMode = controller.mode;
+    var selectedQuickSaveDirectory = controller.defaultQuickSaveDirectory;
     final save = await showDialog<bool>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -1564,6 +1611,53 @@ class _RepositoryPageState extends State<RepositoryPage>
                       ),
                     ),
                   ],
+                  if (!Platform.isAndroid) ...[
+                    const SizedBox(height: 18),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        '快传接收默认保存目录',
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        selectedQuickSaveDirectory ?? '尚未设置',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (controller.photoTransferError case final warning?) ...[
+                      const SizedBox(height: 6),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          warning,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          final path = await getDirectoryPath();
+                          if (path != null && context.mounted) {
+                            setDialogState(
+                              () => selectedQuickSaveDirectory = path,
+                            );
+                          }
+                        },
+                        icon: const Icon(Icons.folder_open_outlined),
+                        label: const Text('选择目录'),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1583,6 +1677,15 @@ class _RepositoryPageState extends State<RepositoryPage>
     );
     if (save != true) return;
     try {
+      if (!Platform.isAndroid &&
+          selectedQuickSaveDirectory != controller.defaultQuickSaveDirectory) {
+        if (selectedQuickSaveDirectory == null) {
+          throw StateError('请选择快传接收默认保存目录。');
+        }
+        await controller.setDefaultQuickSaveDirectory(
+          selectedQuickSaveDirectory!,
+        );
+      }
       if (selectedMode == RepositoryMode.local) {
         await controller.configureLocalRoot(local.text.trim());
       } else {
@@ -1692,6 +1795,19 @@ bool _isImage(String name) => const {
   'gif',
   'bmp',
 }.contains(name.split('.').last.toLowerCase());
+
+class _QuickFileSelection {
+  const _QuickFileSelection({
+    required this.file,
+    required this.name,
+    required this.mimeType,
+  });
+
+  final File file;
+  final String name;
+  final String mimeType;
+}
+
 bool _isPreviewable(String name) =>
     _isImage(name) ||
     const {
@@ -1761,6 +1877,10 @@ String _mimeType(String name) {
     'png' => 'image/png',
     'webp' => 'image/webp',
     'gif' => 'image/gif',
+    'bmp' => 'image/bmp',
+    'heic' => 'image/heic',
+    'heif' => 'image/heif',
+    'avif' => 'image/avif',
     'mp3' => 'audio/mpeg',
     'm4a' => 'audio/mp4',
     'wav' => 'audio/wav',

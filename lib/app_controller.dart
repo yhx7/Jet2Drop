@@ -19,6 +19,7 @@ import 'infrastructure/local_repository_gateway.dart';
 import 'infrastructure/serialized_repository_gateway.dart';
 import 'infrastructure/sftp_repository_gateway.dart';
 import 'core/quick_transfer.dart';
+import 'core/photo_transfer.dart';
 import 'platform/android_transfer_service.dart';
 import 'platform/android_save_file.dart';
 import 'platform/windows_lifecycle_bridge.dart';
@@ -46,6 +47,8 @@ class AppController extends ChangeNotifier {
   static const _sortAscendingKey = 'file_sort_ascending';
   static const _deviceIdKey = 'quick_device_id';
   static const _deviceNameKey = 'quick_device_name';
+  static const _photoTokenKey = 'photo_transfer_token';
+  static const _quickSaveDirectoryKey = 'quick_save_directory';
   static const _pendingTransfersKey = 'pending_transfers_v1';
   static const _quickRoot = '__jet2drop_transfer';
   static const _quickMessages = 'messages';
@@ -81,16 +84,24 @@ class AppController extends ChangeNotifier {
   final Map<String, _QueuedQuickTransfer> _pausedQuickTransfers = {};
   final Set<String> _resumeAfterYield = {};
   final Set<String> _quickLocallySaved = {};
+  final Set<String> _reservedQuickReceivePaths = {};
   bool _isProcessingQuickSendQueue = false;
   bool _foregroundTransferActive = false;
   DateTime? _lastForegroundUpdate;
   DateTime? _lastTransferUiUpdate;
   Timer? _transferUiTimer;
   final QuickTransferService quickTransfer = QuickTransferService();
+  final PhotoTransferClient _photoTransferClient = PhotoTransferClient();
+  PhotoTransferServer? _photoTransferServer;
+  String? defaultQuickSaveDirectory;
+  String? photoTransferError;
   int _quickRefreshGeneration = 0;
   bool _isRefreshingQuickTransfer = false;
   bool _quickRefreshPending = false;
+  bool _quickMutationInProgress = false;
+  bool _disposed = false;
   Completer<void>? _quickRefreshIdle;
+  Future<void> _quickMutationTail = Future<void>.value();
   Timer? _quickMaintenanceTimer;
   DateTime? _lastQuickDeviceRefresh;
   final Map<String, QuickTransferManifest> _quickManifestCache = {};
@@ -179,6 +190,7 @@ class AppController extends ChangeNotifier {
       );
       sortAscending = _preferences.getBool(_sortAscendingKey) ?? true;
       localRoot = _preferences.getString(_rootKey) ?? r'E:\Repository';
+      await _loadDefaultQuickSaveDirectory();
       mode = RepositoryMode.values.byName(
         _preferences.getString(_modeKey) ??
             (Platform.isWindows
@@ -194,6 +206,93 @@ class AppController extends ChangeNotifier {
     } finally {
       isInitializing = false;
       notifyListeners();
+    }
+  }
+
+  Future<void> _loadDefaultQuickSaveDirectory() async {
+    final saved = _preferences.getString(_quickSaveDirectoryKey);
+    if (saved != null && saved.trim().isNotEmpty) {
+      // Do not silently replace a path that the user explicitly selected.
+      defaultQuickSaveDirectory = saved.trim();
+    } else {
+      defaultQuickSaveDirectory = null;
+    }
+  }
+
+  Future<void> setDefaultQuickSaveDirectory(String path) async {
+    final clean = path.trim();
+    if (clean.isEmpty) throw ArgumentError('默认保存目录不能为空。');
+    final directory = Directory(clean);
+    FileStat stat;
+    try {
+      stat = await directory.stat();
+    } on FileSystemException {
+      throw StateError('默认保存目录不存在或无法访问。');
+    }
+    if (stat.type != FileSystemEntityType.directory) {
+      throw StateError('默认保存位置必须是文件夹。');
+    }
+    await _verifyQuickSaveDirectoryWritable(directory);
+    defaultQuickSaveDirectory = clean;
+    await _preferences.setString(_quickSaveDirectoryKey, clean);
+    notifyListeners();
+  }
+
+  Future<void> _verifyQuickSaveDirectoryWritable(Directory directory) async {
+    final probe = File(
+      '${directory.path}${Platform.pathSeparator}.jet2drop-write-${uniqueSuffix()}.tmp',
+    );
+    try {
+      await probe.writeAsBytes(const <int>[0], flush: true);
+      await probe.delete();
+    } on FileSystemException {
+      try {
+        if (await probe.exists()) await probe.delete();
+      } catch (_) {}
+      throw StateError('默认保存目录不可写。');
+    }
+  }
+
+  Future<Directory> _requireDefaultQuickSaveDirectory() async {
+    final path = defaultQuickSaveDirectory;
+    if (path == null || path.trim().isEmpty) {
+      throw StateError('请先在设置中选择快传接收默认保存目录。');
+    }
+    final directory = Directory(path);
+    try {
+      final stat = await directory.stat();
+      if (stat.type != FileSystemEntityType.directory) {
+        throw StateError('快传接收默认保存位置不是文件夹。');
+      }
+      await _verifyQuickSaveDirectoryWritable(directory);
+    } on FileSystemException {
+      throw StateError('快传接收默认保存目录不存在或无法访问。');
+    }
+    return directory;
+  }
+
+  Future<File> defaultQuickReceiveTarget(String name) async {
+    final directory = await _requireDefaultQuickSaveDirectory();
+    final safeName = sanitizeTransferFileName(name);
+    final existing = <String>{};
+    await for (final entity in directory.list(followLinks: false)) {
+      existing.add(entity.uri.pathSegments.last.toLowerCase());
+    }
+    final dot = safeName.lastIndexOf('.');
+    final stem = dot > 0 ? safeName.substring(0, dot) : safeName;
+    final extension = dot > 0 ? safeName.substring(dot) : '';
+    for (var index = 1; ; index++) {
+      final candidateName = index == 1 ? safeName : '$stem ($index)$extension';
+      final candidate = File(
+        '${directory.path}${Platform.pathSeparator}$candidateName',
+      );
+      final key = candidate.path.toLowerCase();
+      if (existing.contains(candidateName.toLowerCase()) ||
+          _reservedQuickReceivePaths.contains(key)) {
+        continue;
+      }
+      _reservedQuickReceivePaths.add(key);
+      return candidate;
     }
   }
 
@@ -282,6 +381,9 @@ class AppController extends ChangeNotifier {
           );
           tasks.add(task);
           if (record['locallySaved'] == true) _quickLocallySaved.add(id);
+          if (!Platform.isAndroid && record['locallySaved'] != true) {
+            _reservedQuickReceivePaths.add(target.path.toLowerCase());
+          }
           final saver = Platform.isAndroid
               ? (File file) => _saveAndroidQuickTarget(
                   file,
@@ -304,7 +406,8 @@ class AppController extends ChangeNotifier {
               '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
             );
             if (await staging.exists()) await staging.delete(recursive: true);
-            if (Platform.isAndroid && await target.exists()) {
+            _reservedQuickReceivePaths.remove(target.path.toLowerCase());
+            if (!_quickLocallySaved.contains(id) && await target.exists()) {
               await target.delete();
             }
           };
@@ -330,6 +433,7 @@ class AppController extends ChangeNotifier {
               source: source,
               targetDevice: targetDevice,
               task: retryTask,
+              name: task.name,
             );
             _quickSendQueue.add(queued);
             _syncForegroundTransfer(force: true);
@@ -519,6 +623,7 @@ class AppController extends ChangeNotifier {
       error = null;
       connectionStatus = RepositoryConnectionStatus.connected;
       await previous?.dispose();
+      await _stopPhotoTransferServer();
       await _initializeQuickTransferSafely();
     } catch (_) {
       await candidate.dispose();
@@ -538,6 +643,7 @@ class AppController extends ChangeNotifier {
     error = null;
     notifyListeners();
     try {
+      await _stopPhotoTransferServer();
       await _gateway?.dispose();
       if (mode == RepositoryMode.local) {
         _gateway = LocalRepositoryGateway(localRoot);
@@ -583,6 +689,7 @@ class AppController extends ChangeNotifier {
         (_) => unawaited(_maintainQuickPresence()),
       );
     } catch (exception) {
+      await _stopPhotoTransferServer();
       quickError = describeError(exception);
       notifyListeners();
     }
@@ -591,6 +698,7 @@ class AppController extends ChangeNotifier {
   Future<void> _maintainQuickPresence() async {
     if (!isReady || hasRunningTransfers) return;
     try {
+      await _startPhotoTransferServer();
       await _publishDeviceRegistration();
       await refreshQuickTransfer(refreshDevices: true);
     } catch (exception) {
@@ -598,6 +706,49 @@ class AppController extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  Future<void> _startPhotoTransferServer() async {
+    if (!Platform.isWindows && !Platform.isMacOS) {
+      photoTransferError = null;
+      return;
+    }
+    if (_photoTransferServer?.isRunning == true) return;
+    await _stopPhotoTransferServer();
+    if (defaultQuickSaveDirectory == null) {
+      photoTransferError = '请先设置快传接收默认保存目录。';
+      return;
+    }
+    var token = _preferences.getString(_photoTokenKey);
+    if (token == null || token.length < 64) {
+      token = _newPhotoToken();
+      await _preferences.setString(_photoTokenKey, token);
+    }
+    final server = PhotoTransferServer(
+      token: token,
+      saveDirectoryProvider: () async => defaultQuickSaveDirectory,
+    );
+    try {
+      if (await server.start()) {
+        _photoTransferServer = server;
+        photoTransferError = null;
+      } else {
+        photoTransferError = '未检测到 Tailscale 地址，照片直传暂不可用。';
+      }
+    } on SocketException {
+      photoTransferError = '照片直传服务启动失败，请确认 Tailscale 正常运行。';
+    }
+  }
+
+  Future<void> _stopPhotoTransferServer() async {
+    final server = _photoTransferServer;
+    _photoTransferServer = null;
+    if (server != null) await server.stop();
+  }
+
+  String _newPhotoToken() => List<String>.generate(
+    32,
+    (_) => Random.secure().nextInt(0x100).toRadixString(16).padLeft(2, '0'),
+  ).join();
 
   Future<void> onAppResumed() async {
     if (hasActiveTransfers || isLoading) return;
@@ -717,6 +868,9 @@ class AppController extends ChangeNotifier {
     if (normalized.contains('active transfers')) {
       return '有任务正在传输，请完成或取消后再更改连接。';
     }
+    if (normalized.contains('默认保存')) {
+      return message.replaceFirst(RegExp(r'^Bad state:\s*'), '');
+    }
     if (normalized.startsWith('bad state: download failed:')) {
       return message.substring('Bad state: Download failed:'.length).trim();
     }
@@ -728,6 +882,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> _initializeQuickTransfer() async {
     await _loadQuickIdentity();
+    await _startPhotoTransferServer();
     await _ensureQuickDirectories();
     await _publishDeviceRegistration();
     await refreshQuickTransfer();
@@ -797,10 +952,13 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _publishDeviceRegistration() async {
+    final photoServer = _photoTransferServer;
     final registration = QuickDevice(
       id: deviceId,
       name: deviceName,
       updatedAt: DateTime.now(),
+      photoEndpoint: photoServer?.endpoint,
+      photoToken: photoServer?.isRunning == true ? photoServer!.token : null,
     );
     final source = await _writeQuickJson(
       'quick-device-$deviceId.json',
@@ -844,6 +1002,10 @@ class AppController extends ChangeNotifier {
   Future<void> refreshQuickTransfer({bool refreshDevices = false}) async {
     final gateway = _gateway;
     if (gateway == null || deviceId.isEmpty) {
+      return;
+    }
+    if (_quickMutationInProgress) {
+      _quickRefreshPending = true;
       return;
     }
     if (hasRunningTransfers) {
@@ -1016,7 +1178,9 @@ class AppController extends ChangeNotifier {
       }
     } finally {
       _isRefreshingQuickTransfer = false;
-      if (_quickRefreshPending && !hasRunningTransfers) {
+      if (_quickRefreshPending &&
+          !hasRunningTransfers &&
+          !_quickMutationInProgress) {
         unawaited(refreshQuickTransfer(refreshDevices: refreshDevices));
       } else if (!idle.isCompleted) {
         idle.complete();
@@ -1327,7 +1491,9 @@ class AppController extends ChangeNotifier {
   }
 
   void pauseTask(TransferTask task) {
-    if (task.status != TransferStatus.running || task.isPaused) {
+    if (task.status != TransferStatus.running ||
+        task.isPaused ||
+        !task.supportsPause) {
       return;
     }
     task.isPaused = true;
@@ -1482,6 +1648,9 @@ class AppController extends ChangeNotifier {
   Future<QuickTransferManifest> publishQuickTransfer(
     File source, {
     required String targetDevice,
+    String? originalName,
+    String? mimeType,
+    bool isPhoto = false,
   }) async {
     final target = targetDevice.trim();
     if (target.isEmpty || target == deviceId) {
@@ -1493,11 +1662,26 @@ class AppController extends ChangeNotifier {
       );
     }
     await validateTransferSelection([source]);
+    final name = sanitizeTransferFileName(
+      originalName ?? source.uri.pathSegments.last,
+    );
+    if (isPhoto) {
+      final selectedMime = mimeType?.split(';').first.trim().toLowerCase();
+      if (!isSupportedPhotoTransfer(name: name, mimeType: selectedMime)) {
+        throw StateError('照片必须同时具有受支持的图片扩展名和 MIME 类型。');
+      }
+      return _publishPhotoTransfer(
+        source,
+        targetDevice: target,
+        name: name,
+        mimeType: selectedMime!,
+      );
+    }
     final taskId = uniqueSuffix();
     final durableSource = await _prepareDurableSource(source, taskId);
     final task = TransferTask(
       id: taskId,
-      name: sanitizeTransferFileName(source.uri.pathSegments.last),
+      name: name,
       direction: TransferDirection.quickSend,
       totalBytes: await durableSource.file.length(),
       status: TransferStatus.queued,
@@ -1507,6 +1691,7 @@ class AppController extends ChangeNotifier {
       source: durableSource.file,
       targetDevice: target,
       task: task,
+      name: name,
     );
     _quickSendQueue.add(queued);
     _syncForegroundTransfer(force: true);
@@ -1534,6 +1719,7 @@ class AppController extends ChangeNotifier {
         source: durableSource.file,
         targetDevice: target,
         task: retryTask,
+        name: task.name,
       );
       _quickSendQueue.add(retry);
       notifyListeners();
@@ -1544,6 +1730,83 @@ class AppController extends ChangeNotifier {
 
     unawaited(_processQuickSendQueue());
     return queued.completer.future;
+  }
+
+  Future<QuickTransferManifest> _publishPhotoTransfer(
+    File source, {
+    required String targetDevice,
+    required String name,
+    required String mimeType,
+  }) async {
+    final taskId = uniqueSuffix();
+    final task = TransferTask(
+      id: taskId,
+      name: name,
+      direction: TransferDirection.quickSend,
+      totalBytes: await source.length(),
+      status: TransferStatus.running,
+      supportsPause: false,
+    );
+    tasks.insert(0, task);
+    final control = TransferControl();
+    _transferControls[task.id] = control;
+    _syncForegroundTransfer(force: true);
+    notifyListeners();
+    try {
+      final target = quickRecipients.firstWhere(
+        (device) => device.id == targetDevice,
+      );
+      if (!target.supportsPhotoTransfer) {
+        throw const PhotoTransferException('目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。');
+      }
+      final receipt = await _photoTransferClient.send(
+        endpoint: target.photoEndpoint!,
+        token: target.photoToken!,
+        source: source,
+        fileName: name,
+        mimeType: mimeType,
+        control: control,
+        onProgress: (current, _) {
+          task.transferredBytes = current;
+          _notifyTransferProgress();
+        },
+      );
+      task
+        ..transferredBytes = receipt.size
+        ..status = TransferStatus.completed;
+      return quickTransfer.describe(
+        source,
+        name: receipt.name,
+        size: receipt.size,
+        checksum: receipt.sha256,
+        senderDevice: deviceId,
+        targetDevice: targetDevice,
+        transferId: task.id,
+      );
+    } on TransferCancelled {
+      task
+        ..status = TransferStatus.cancelled
+        ..cancelRequested = true
+        ..isPaused = false;
+      rethrow;
+    } catch (exception) {
+      if (control.isCancelled || task.cancelRequested) {
+        task
+          ..status = TransferStatus.cancelled
+          ..isPaused = false;
+        throw const TransferCancelled();
+      }
+      task
+        ..status = TransferStatus.failed
+        ..error = exception is PhotoTransferException
+            ? exception.message
+            : describeError(exception);
+      rethrow;
+    } finally {
+      _transferControls.remove(task.id);
+      _syncForegroundTransfer(force: true);
+      notifyListeners();
+    }
   }
 
   Future<void> _processQuickSendQueue() async {
@@ -1571,6 +1834,7 @@ class AppController extends ChangeNotifier {
           final manifest = await _executeQuickTransfer(
             queued.source,
             targetDevice: queued.targetDevice,
+            name: queued.name,
             task: task,
             control: control,
           );
@@ -1625,6 +1889,7 @@ class AppController extends ChangeNotifier {
   Future<QuickTransferManifest> _executeQuickTransfer(
     File source, {
     required String targetDevice,
+    required String name,
     required TransferTask task,
     required TransferControl control,
   }) async {
@@ -1658,6 +1923,7 @@ class AppController extends ChangeNotifier {
       );
       final manifest = quickTransfer.describe(
         source,
+        name: name,
         size: task.totalBytes,
         checksum: checksum ?? (throw StateError('Upload checksum is missing.')),
         senderDevice: deviceId,
@@ -1739,20 +2005,31 @@ class AppController extends ChangeNotifier {
         '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
       );
       if (await staging.exists()) await staging.delete(recursive: true);
-      if (Platform.isAndroid && await target.exists()) await target.delete();
+      _reservedQuickReceivePaths.remove(target.path.toLowerCase());
+      if (!_quickLocallySaved.contains(task.id) && await target.exists()) {
+        await target.delete();
+      }
     };
-    await _rememberPending({
-      'kind': 'quickReceive',
-      'id': task.id,
-      'name': task.name,
-      'totalBytes': task.totalBytes,
-      'manifest': manifest.toJson(),
-      'targetPath': target.path,
-      'androidTargetUri': ?androidTargetUri,
-      'saveAsMedia': saveAsMedia,
-      'mimeType': mimeType,
-      'locallySaved': false,
-    });
+    try {
+      await _rememberPending({
+        'kind': 'quickReceive',
+        'id': task.id,
+        'name': task.name,
+        'totalBytes': task.totalBytes,
+        'manifest': manifest.toJson(),
+        'targetPath': target.path,
+        'androidTargetUri': ?androidTargetUri,
+        'saveAsMedia': saveAsMedia,
+        'mimeType': mimeType,
+        'locallySaved': false,
+      });
+    } catch (_) {
+      _reservedQuickReceivePaths.remove(target.path.toLowerCase());
+      tasks.remove(task);
+      _retryActions.remove(task.id);
+      _cleanupActions.remove(task.id);
+      rethrow;
+    }
     await _retryActions[task.id]!(task);
     if (task.status == TransferStatus.failed) {
       throw StateError(task.error ?? 'Quick transfer failed.');
@@ -1800,8 +2077,12 @@ class AppController extends ChangeNotifier {
     var completed = false;
     try {
       if (!_quickLocallySaved.contains(task.id)) {
-        final alreadyDownloaded =
+        var alreadyDownloaded =
             await target.exists() && await target.length() == manifest.size;
+        if (alreadyDownloaded) {
+          alreadyDownloaded =
+              await quickTransfer.checksum(target) == manifest.sha256;
+        }
         if (!alreadyDownloaded) {
           await _resetConnection();
           final support = await getApplicationSupportDirectory();
@@ -1812,9 +2093,14 @@ class AppController extends ChangeNotifier {
           final payload = File(
             '${staging.path}${Platform.pathSeparator}${manifest.id}.bin',
           );
+          String? downloadedChecksum;
           _cleanupActions[task.id] = () async {
             if (await staging!.exists()) await staging.delete(recursive: true);
-            if (await target.exists()) await target.delete();
+            _reservedQuickReceivePaths.remove(target.path.toLowerCase());
+            if (!_quickLocallySaved.contains(task.id) &&
+                await target.exists()) {
+              await target.delete();
+            }
           };
           final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
           await _retryOperation(
@@ -1822,6 +2108,7 @@ class AppController extends ChangeNotifier {
               remotePath: '$remotePackage/payload.bin',
               target: payload,
               resumeId: manifest.id,
+              onChecksum: (value) => downloadedChecksum = value,
               control: control,
               onProgress: (current, _) {
                 task.transferredBytes = current;
@@ -1836,6 +2123,8 @@ class AppController extends ChangeNotifier {
             manifest,
             payload,
             target,
+            verifiedChecksum: downloadedChecksum,
+            verifiedSize: downloadedChecksum == null ? null : manifest.size,
             onProgress: (current, _) {
               task.transferredBytes = current;
               _notifyTransferProgress();
@@ -1846,6 +2135,7 @@ class AppController extends ChangeNotifier {
         notifyListeners();
         if (saveTarget != null) await saveTarget(target);
         _quickLocallySaved.add(task.id);
+        _reservedQuickReceivePaths.remove(target.path.toLowerCase());
         final record = _pendingTransferRecords[task.id];
         if (record != null) {
           record['locallySaved'] = true;
@@ -1923,50 +2213,70 @@ class AppController extends ChangeNotifier {
     await refreshQuickTransfer();
   }
 
-  Future<void> deleteQuickTransfer(QuickTransferManifest manifest) async {
+  Future<void> deleteQuickTransfer(QuickTransferManifest manifest) {
+    final result = _quickMutationTail.then(
+      (_) => _deleteQuickTransferNow(manifest),
+    );
+    _quickMutationTail = result.then<void>((_) {}, onError: (_, _) {});
+    return result;
+  }
+
+  Future<void> _deleteQuickTransferNow(QuickTransferManifest manifest) async {
     if (manifest.senderDevice != deviceId &&
         manifest.targetDevice != deviceId) {
       throw StateError('This device is not a participant in the transfer.');
     }
-    final previous = quickInbox;
-    _hiddenQuickTransferIds.add(manifest.id);
-    _quickRefreshGeneration++;
-    quickInbox = previous
-        .where((item) => item.id != manifest.id)
-        .toList(growable: false);
-    notifyListeners();
-    final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
+    _quickMutationInProgress = true;
     try {
-      await _resetConnection();
-      try {
-        await _retryOperation(
-          () => _gateway!.deleteEntry(messagePath, recursive: true),
-        );
-      } catch (exception, stackTrace) {
-        var stillExists = true;
-        try {
-          final packages = await _retryOperation(
-            () => _gateway!.listDirectory('$_quickRoot/$_quickMessages'),
-          );
-          stillExists = packages.any(
-            (entry) => entry.isDirectory && entry.name == manifest.id,
-          );
-        } catch (_) {
-          Error.throwWithStackTrace(exception, stackTrace);
-        }
-        if (stillExists) Error.throwWithStackTrace(exception, stackTrace);
+      final refreshIdle = _quickRefreshIdle;
+      if (_isRefreshingQuickTransfer && refreshIdle != null) {
+        _quickRefreshGeneration++;
+        await refreshIdle.future;
       }
-      _quickManifestCache.remove('$messagePath/manifest.json');
-      await refreshQuickTransfer();
-    } catch (_) {
-      _hiddenQuickTransferIds.remove(manifest.id);
-      quickInbox = previous;
+      final previous = quickInbox;
+      _hiddenQuickTransferIds.add(manifest.id);
+      _quickRefreshGeneration++;
+      quickInbox = previous
+          .where((item) => item.id != manifest.id)
+          .toList(growable: false);
       notifyListeners();
-      rethrow;
+      final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
+      try {
+        await _resetConnection();
+        try {
+          await _retryOperation(
+            () => _gateway!.deleteEntry(messagePath, recursive: true),
+          );
+        } catch (exception, stackTrace) {
+          var stillExists = true;
+          try {
+            final packages = await _retryOperation(
+              () => _gateway!.listDirectory('$_quickRoot/$_quickMessages'),
+            );
+            stillExists = packages.any(
+              (entry) => entry.isDirectory && entry.name == manifest.id,
+            );
+          } catch (_) {
+            Error.throwWithStackTrace(exception, stackTrace);
+          }
+          if (stillExists) Error.throwWithStackTrace(exception, stackTrace);
+        }
+        _quickManifestCache.remove('$messagePath/manifest.json');
+      } catch (_) {
+        _hiddenQuickTransferIds.remove(manifest.id);
+        quickInbox = previous;
+        notifyListeners();
+        rethrow;
+      }
+      _hiddenQuickTransferIds.remove(manifest.id);
+      quickError = null;
+      notifyListeners();
+    } finally {
+      _quickMutationInProgress = false;
+      if (_quickRefreshPending && !hasRunningTransfers) {
+        unawaited(refreshQuickTransfer());
+      }
     }
-    _hiddenQuickTransferIds.remove(manifest.id);
-    quickError = null;
-    notifyListeners();
   }
 
   Future<void> _resetConnection() async {
@@ -2125,9 +2435,18 @@ class AppController extends ChangeNotifier {
   }
 
   @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
+  @override
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
     _quickMaintenanceTimer?.cancel();
     _transferUiTimer?.cancel();
+    unawaited(_stopPhotoTransferServer());
+    unawaited(_photoTransferClient.dispose());
     _gateway?.dispose();
     super.dispose();
   }
@@ -2143,11 +2462,13 @@ class _QueuedQuickTransfer {
     required this.source,
     required this.targetDevice,
     required this.task,
+    required this.name,
   });
 
   final File source;
   final String targetDevice;
   final TransferTask task;
+  final String name;
   final Completer<QuickTransferManifest> completer =
       Completer<QuickTransferManifest>();
 }

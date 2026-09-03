@@ -396,6 +396,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
     required File target,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   }) async {
     final sftp = await _connection;
@@ -420,7 +421,13 @@ class SftpRepositoryGateway implements RepositoryGateway {
       mode: written == 0 ? FileMode.write : FileMode.append,
     );
     final handle = await sftp.open(remote, mode: SftpFileOpenMode.read);
+    final checksum = onChecksum == null ? null : Sha256Accumulator();
     try {
+      if (checksum != null && written > 0) {
+        await for (final chunk in temporary.openRead(0, written)) {
+          checksum.add(chunk);
+        }
+      }
       onProgress?.call(written, total);
       await for (final chunk
           in handle
@@ -434,12 +441,14 @@ class SftpRepositoryGateway implements RepositoryGateway {
                 ),
               )) {
         await control?.checkpoint();
+        checksum?.add(chunk);
         sink.add(chunk);
         written += chunk.length;
         onProgress?.call(written, total);
       }
       await sink.flush();
       await sink.close();
+      if (checksum != null) onChecksum!(checksum.close());
       await handle.close();
       await control?.checkpoint();
       final backup = File('${target.path}.jet2drop-backup-${uniqueSuffix()}');

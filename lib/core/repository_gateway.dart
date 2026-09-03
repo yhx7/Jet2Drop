@@ -33,6 +33,7 @@ abstract interface class RepositoryGateway {
     required File target,
     String? resumeId,
     ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
     TransferControl? control,
   });
   Future<File> materializeForPreview(

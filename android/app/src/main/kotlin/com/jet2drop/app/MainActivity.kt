@@ -90,18 +90,23 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun copyPickedMediaToCache(uri: android.net.Uri): String {
+    private fun copyPickedMediaToCache(uri: android.net.Uri): Map<String, String> {
         val displayName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
             ?.use { cursor ->
                 if (cursor.moveToFirst()) cursor.getString(0) else null
             }
             ?.replace(Regex("[\\\\/:*?\"<>|]"), "_")
             ?: "media"
+        val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
         val target = File(cacheDir, "quick-media-${UUID.randomUUID()}-$displayName")
         contentResolver.openInputStream(uri)?.use { input ->
-            target.outputStream().use { output -> input.copyTo(output) }
+            target.outputStream().use { output -> input.copyTo(output, 256 * 1024) }
         } ?: error("Unable to read selected media")
-        return target.absolutePath
+        return mapOf(
+            "path" to target.absolutePath,
+            "name" to displayName,
+            "mimeType" to mimeType,
+        )
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
