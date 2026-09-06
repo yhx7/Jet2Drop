@@ -618,6 +618,132 @@ void main() {
   });
 
   test(
+    'photo send refreshes a cached disabled receiver before creating a task',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-photo-refresh-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      final photos = Directory('${root.path}${Platform.pathSeparator}photos');
+      await repository.create();
+      await photos.create();
+      final server = PhotoTransferServer(
+        token: 'photo-refresh-token',
+        bindAddress: InternetAddress.loopbackIPv4,
+        endpointHost: InternetAddress.loopbackIPv4.address,
+        saveDirectoryProvider: () async => photos.path,
+      );
+      addTearDown(server.stop);
+      expect(await server.start(), isTrue);
+      final targetId = 'target-device';
+      final registrationDirectory = Directory(
+        '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+        '${Platform.pathSeparator}devices',
+      );
+      await registrationDirectory.create(recursive: true);
+      final registration = File(
+        '${registrationDirectory.path}${Platform.pathSeparator}$targetId.json',
+      );
+      Future<void> writeRegistration({required bool enabled}) async {
+        final device = QuickDevice(
+          id: targetId,
+          name: '接收设备',
+          updatedAt: DateTime.now(),
+          photoEndpoint: enabled ? server.endpoint : null,
+          photoToken: enabled ? 'photo-refresh-token' : null,
+        );
+        await registration.writeAsString(jsonEncode(device.toJson()));
+      }
+
+      await writeRegistration(enabled: false);
+      final photo = File('${root.path}${Platform.pathSeparator}original.jpg');
+      await photo.writeAsBytes([1, 2, 3, 4]);
+      final controller = await HttpOverrides.runWithHttpOverrides(
+        () => createController(repository),
+        _RealHttpOverrides(),
+      );
+      addTearDown(controller.dispose);
+      await controller.refreshQuickTransfer(refreshDevices: true);
+      expect(
+        controller.quickDevices
+            .singleWhere((device) => device.id == targetId)
+            .supportsPhotoTransfer,
+        isFalse,
+      );
+
+      await writeRegistration(enabled: true);
+      final direct = await controller.publishQuickTransfer(
+        photo,
+        targetDevice: targetId,
+        mimeType: 'image/jpeg',
+        isPhoto: true,
+      );
+
+      expect(direct.name, 'original.jpg');
+      expect(
+        await File(
+          '${photos.path}${Platform.pathSeparator}original.jpg',
+        ).readAsBytes(),
+        [1, 2, 3, 4],
+      );
+      expect(
+        controller.tasks.singleWhere((task) => task.id == direct.id).status,
+        TransferStatus.completed,
+      );
+    },
+  );
+
+  test(
+    'forced device refresh rereads registrations even when mtime is unchanged',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-device-cache-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final targetId = 'target-device';
+      final registration = File(
+        '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+        '${Platform.pathSeparator}devices${Platform.pathSeparator}$targetId.json',
+      );
+      Future<void> writeRegistration(bool enabled) async {
+        final device = QuickDevice(
+          id: targetId,
+          name: '接收设备',
+          updatedAt: DateTime.now(),
+          photoEndpoint: enabled ? 'http://127.0.0.1:1234' : null,
+          photoToken: enabled ? 'cache-refresh-token' : null,
+        );
+        await registration.writeAsString(jsonEncode(device.toJson()));
+      }
+
+      await writeRegistration(false);
+      await controller.refreshQuickTransfer(refreshDevices: true);
+      final originalModified = (await registration.stat()).modified;
+      expect(
+        controller.quickDevices
+            .singleWhere((device) => device.id == targetId)
+            .supportsPhotoTransfer,
+        isFalse,
+      );
+
+      await writeRegistration(true);
+      await registration.setLastModified(originalModified);
+      await controller.refreshQuickTransfer(refreshDevices: true);
+      expect(
+        controller.quickDevices
+            .singleWhere((device) => device.id == targetId)
+            .supportsPhotoTransfer,
+        isTrue,
+      );
+    },
+  );
+
+  test(
     'claimed quick records delete once without stale refresh reappearing',
     () async {
       final root = await Directory.systemTemp.createTemp(

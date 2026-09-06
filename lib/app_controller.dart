@@ -98,6 +98,7 @@ class AppController extends ChangeNotifier {
   int _quickRefreshGeneration = 0;
   bool _isRefreshingQuickTransfer = false;
   bool _quickRefreshPending = false;
+  bool _quickRefreshDevicesPending = false;
   bool _quickMutationInProgress = false;
   bool _disposed = false;
   Completer<void>? _quickRefreshIdle;
@@ -236,6 +237,20 @@ class AppController extends ChangeNotifier {
     defaultQuickSaveDirectory = clean;
     await _preferences.setString(_quickSaveDirectoryKey, clean);
     notifyListeners();
+    // The save directory controls whether this desktop advertises the direct
+    // photo capability.  Publish the changed registration immediately when a
+    // connection is already active; reconnecting is not required for peers
+    // to observe a newly enabled (or restarted) receiver.
+    if (isReady && deviceId.isNotEmpty) {
+      try {
+        await _startPhotoTransferServer();
+        await _publishDeviceRegistration();
+        await refreshQuickTransfer(refreshDevices: true);
+      } catch (exception) {
+        quickError = describeError(exception);
+        notifyListeners();
+      }
+    }
   }
 
   Future<void> _verifyQuickSaveDirectoryWritable(Directory directory) async {
@@ -616,6 +631,7 @@ class AppController extends ChangeNotifier {
       await onCommit();
       final previous = _gateway;
       _gateway = candidate;
+      _invalidateQuickState();
       currentPath = '';
       entries = candidateEntries;
       isReady = true;
@@ -660,6 +676,7 @@ class AppController extends ChangeNotifier {
           ),
         );
       }
+      _invalidateQuickState();
       await _gateway!.initialize().timeout(const Duration(seconds: 15));
       currentPath = '';
       entries = await _retryOperation(() => _gateway!.listDirectory(''));
@@ -814,15 +831,15 @@ class AppController extends ChangeNotifier {
       return '无法解析服务器地址。请确认手机已连接 Tailscale、使用同一 Tailnet，并检查主机名是否填写正确。';
     }
     if (normalized.contains('connection refused')) {
-      return '服务器拒绝连接。请确认 Windows 已开机，Jet2Drop SFTP 服务正在运行且端口 2022 未被防火墙阻止。';
+      return '服务器拒绝连接。请确认接收电脑已开机，Jet2Drop SFTP 服务正在运行且端口 2022 未被防火墙阻止。';
     }
     if (normalized.contains('connection timed out') ||
         normalized.contains('sftp connection timed out') ||
         normalized.contains('sftp handshake timed out')) {
-      return '连接服务器超时。请确认 Windows 未休眠、两台设备均已连接 Tailscale，然后重试。';
+      return '连接服务器超时。请确认接收电脑未休眠、两台设备均已连接 Tailscale，然后重试。';
     }
     if (normalized.contains('timed out')) {
-      return '传输在等待服务器响应时超时。请确认 Windows 未休眠、Tailscale 连接正常后重试；未完成的临时文件已自动清理。';
+      return '传输在等待服务器响应时超时。请确认接收电脑未休眠、Tailscale 连接正常后重试；未完成的临时文件已自动清理。';
     }
     if (normalized.contains('authentication') ||
         normalized.contains('permission denied') ||
@@ -885,7 +902,15 @@ class AppController extends ChangeNotifier {
     await _startPhotoTransferServer();
     await _ensureQuickDirectories();
     await _publishDeviceRegistration();
-    await refreshQuickTransfer();
+    await refreshQuickTransfer(refreshDevices: true);
+  }
+
+  void _invalidateQuickState() {
+    _lastQuickDeviceRefresh = null;
+    _quickDeviceCache.clear();
+    _quickManifestCache.clear();
+    quickDevices = const [];
+    quickInbox = const [];
   }
 
   Future<void> _loadQuickIdentity() async {
@@ -917,7 +942,7 @@ class AppController extends ChangeNotifier {
     deviceName = clean;
     await _preferences.setString(_deviceNameKey, clean);
     await _publishDeviceRegistration();
-    await refreshQuickTransfer();
+    await refreshQuickTransfer(refreshDevices: true);
   }
 
   Future<void> _ensureQuickDirectories() async {
@@ -1006,24 +1031,32 @@ class AppController extends ChangeNotifier {
     }
     if (_quickMutationInProgress) {
       _quickRefreshPending = true;
+      _quickRefreshDevicesPending =
+          _quickRefreshDevicesPending || refreshDevices;
       return;
     }
     if (hasRunningTransfers) {
       _quickRefreshPending = true;
+      _quickRefreshDevicesPending =
+          _quickRefreshDevicesPending || refreshDevices;
       return;
     }
     final idle = _quickRefreshIdle ??= Completer<void>();
     if (_isRefreshingQuickTransfer) {
       _quickRefreshPending = true;
+      _quickRefreshDevicesPending =
+          _quickRefreshDevicesPending || refreshDevices;
       return idle.future;
     }
+    final forceDeviceRefresh = refreshDevices || _quickRefreshDevicesPending;
+    _quickRefreshDevicesPending = false;
     _quickRefreshPending = false;
     _isRefreshingQuickTransfer = true;
     final generation = ++_quickRefreshGeneration;
     try {
       var registered = quickDevices;
       final shouldRefreshDevices =
-          refreshDevices ||
+          forceDeviceRefresh ||
           _lastQuickDeviceRefresh == null ||
           DateTime.now().difference(_lastQuickDeviceRefresh!) >=
               const Duration(minutes: 1);
@@ -1039,7 +1072,9 @@ class AppController extends ChangeNotifier {
             try {
               final cached = _quickDeviceCache[entry.path];
               final device =
-                  cached != null && cached.modifiedAt == entry.modifiedAt
+                  !shouldRefreshDevices &&
+                      cached != null &&
+                      cached.modifiedAt == entry.modifiedAt
                   ? cached.device
                   : QuickDevice.fromJson(
                       jsonDecode(await _readQuickText(entry.path))
@@ -1181,7 +1216,12 @@ class AppController extends ChangeNotifier {
       if (_quickRefreshPending &&
           !hasRunningTransfers &&
           !_quickMutationInProgress) {
-        unawaited(refreshQuickTransfer(refreshDevices: refreshDevices));
+        final nextForceDeviceRefresh =
+            forceDeviceRefresh || _quickRefreshDevicesPending;
+        _quickRefreshDevicesPending = false;
+        unawaited(
+          refreshQuickTransfer(refreshDevices: nextForceDeviceRefresh),
+        );
       } else if (!idle.isCompleted) {
         idle.complete();
         if (identical(_quickRefreshIdle, idle)) _quickRefreshIdle = null;
@@ -1656,25 +1696,45 @@ class AppController extends ChangeNotifier {
     if (target.isEmpty || target == deviceId) {
       throw ArgumentError('Cannot send a quick transfer to this device.');
     }
-    if (!quickRecipients.any((item) => item.id == target)) {
+    final name = sanitizeTransferFileName(
+      originalName ?? source.uri.pathSegments.last,
+    );
+    QuickDevice? recipient = quickRecipients
+        .where((item) => item.id == target)
+        .firstOrNull;
+    if (isPhoto &&
+        (recipient == null || !recipient.supportsPhotoTransfer)) {
+      // Device registrations are deliberately cached for ordinary inbox
+      // refreshes, but a photo send must confirm the receiver's current
+      // capability before creating a running task.  This covers a desktop
+      // that has just selected its save directory and republished its token.
+      await refreshQuickTransfer(refreshDevices: true);
+      recipient = quickRecipients
+          .where((item) => item.id == target)
+          .firstOrNull;
+    }
+    if (recipient == null) {
       throw ArgumentError(
         'The target device is unavailable or belongs to this device.',
       );
     }
     await validateTransferSelection([source]);
-    final name = sanitizeTransferFileName(
-      originalName ?? source.uri.pathSegments.last,
-    );
     if (isPhoto) {
       final selectedMime = mimeType?.split(';').first.trim().toLowerCase();
       if (!isSupportedPhotoTransfer(name: name, mimeType: selectedMime)) {
         throw StateError('照片必须同时具有受支持的图片扩展名和 MIME 类型。');
+      }
+      if (!recipient.supportsPhotoTransfer) {
+        throw const PhotoTransferException(
+          '目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。',
+        );
       }
       return _publishPhotoTransfer(
         source,
         targetDevice: target,
         name: name,
         mimeType: selectedMime!,
+        recipient: recipient,
       );
     }
     final taskId = uniqueSuffix();
@@ -1737,7 +1797,13 @@ class AppController extends ChangeNotifier {
     required String targetDevice,
     required String name,
     required String mimeType,
+    required QuickDevice recipient,
   }) async {
+    if (!recipient.supportsPhotoTransfer) {
+      throw const PhotoTransferException(
+        '目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。',
+      );
+    }
     final taskId = uniqueSuffix();
     final task = TransferTask(
       id: taskId,
@@ -1753,15 +1819,9 @@ class AppController extends ChangeNotifier {
     _syncForegroundTransfer(force: true);
     notifyListeners();
     try {
-      final target = quickRecipients.firstWhere(
-        (device) => device.id == targetDevice,
-      );
-      if (!target.supportsPhotoTransfer) {
-        throw const PhotoTransferException('目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。');
-      }
       final receipt = await _photoTransferClient.send(
-        endpoint: target.photoEndpoint!,
-        token: target.photoToken!,
+        endpoint: recipient.photoEndpoint!,
+        token: recipient.photoToken!,
         source: source,
         fileName: name,
         mimeType: mimeType,

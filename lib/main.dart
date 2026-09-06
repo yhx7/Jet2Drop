@@ -134,7 +134,7 @@ class _RepositoryPageState extends State<RepositoryPage>
     WidgetsBinding.instance.addObserver(this);
     _quickRefreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       if (mounted && _page == 1 && controller.isReady) {
-        unawaited(controller.refreshQuickTransfer());
+        unawaited(controller.refreshQuickTransfer(refreshDevices: true));
       }
     });
   }
@@ -250,7 +250,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   void _selectPage(int value) {
     setState(() => _page = value);
     if (value == 1 && controller.isReady) {
-      unawaited(controller.refreshQuickTransfer());
+      unawaited(controller.refreshQuickTransfer(refreshDevices: true));
     }
   }
 
@@ -669,7 +669,8 @@ class _RepositoryPageState extends State<RepositoryPage>
           ? _quickTarget
           : (recipients.isEmpty ? null : recipients.first.id);
       return RefreshIndicator(
-        onRefresh: controller.refreshQuickTransfer,
+        onRefresh: () =>
+            controller.refreshQuickTransfer(refreshDevices: true),
         child: ListView(
           padding: EdgeInsets.all(compact ? 16 : 28),
           children: [
@@ -690,7 +691,9 @@ class _RepositoryPageState extends State<RepositoryPage>
                 ),
                 IconButton(
                   tooltip: '刷新设备与收件箱',
-                  onPressed: controller.refreshQuickTransfer,
+                  onPressed: () => controller.refreshQuickTransfer(
+                    refreshDevices: true,
+                  ),
                   icon: const Icon(Icons.refresh),
                 ),
               ],
@@ -1578,7 +1581,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                     TextField(
                       controller: local,
                       decoration: const InputDecoration(
-                        labelText: 'Windows 仓库路径',
+                        labelText: '本地仓库路径',
                         hintText: r'E:\Repository',
                       ),
                     ),
