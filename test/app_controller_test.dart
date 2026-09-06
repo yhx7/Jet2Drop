@@ -29,6 +29,23 @@ void main() {
         (_) async => pluginData.path,
       );
 
+  Future<void> waitForQuickInitialization(AppController controller) async {
+    for (
+      var attempt = 0;
+      attempt < 100 &&
+          !controller.quickDevices.any(
+            (device) => device.id == controller.deviceId,
+          );
+      attempt++
+    ) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect(
+      controller.quickDevices.any((device) => device.id == controller.deviceId),
+      isTrue,
+    );
+  }
+
   Future<AppController> createController(Directory repository) async {
     SharedPreferences.setMockInitialValues({
       'repository_mode': RepositoryMode.local.name,
@@ -36,9 +53,28 @@ void main() {
     });
     final controller = AppController();
     await controller.initialize();
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await waitForQuickInitialization(controller);
     return controller;
   }
+
+  test('concurrent connect requests share one operation', () async {
+    final root = await Directory.systemTemp.createTemp('jet2drop-connect-');
+    addTearDown(() => root.delete(recursive: true));
+    final repository = Directory(
+      '${root.path}${Platform.pathSeparator}repository',
+    );
+    await repository.create();
+    final controller = await createController(repository);
+    addTearDown(controller.dispose);
+
+    final first = controller.connect();
+    final second = controller.connect();
+
+    expect(identical(first, second), isTrue);
+    await Future.wait<void>([first, second]);
+    expect(controller.isReady, isTrue);
+    await waitForQuickInitialization(controller);
+  });
 
   test('download is complete only after its final save succeeds', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-controller-');
@@ -229,13 +265,32 @@ void main() {
       await controller.initialize();
       addTearDown(controller.dispose);
 
+      for (
+        var attempt = 0;
+        attempt < 100 && controller.tasks.isEmpty;
+        attempt++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+
       expect(controller.tasks.map((task) => task.id), ['valid-task']);
       expect(controller.canRetryTask(controller.tasks.single), isTrue);
       final preferences = await SharedPreferences.getInstance();
+      for (
+        var attempt = 0;
+        attempt < 100 &&
+            (preferences.getString('pending_transfers_v1') ?? '').contains(
+              'damaged-task',
+            );
+        attempt++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
       expect(
         preferences.getString('pending_transfers_v1'),
         isNot(contains('damaged-task')),
       );
+      await waitForQuickInitialization(controller);
     },
   );
 

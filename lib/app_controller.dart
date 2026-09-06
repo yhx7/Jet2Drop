@@ -56,6 +56,7 @@ class AppController extends ChangeNotifier {
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   late SharedPreferences _preferences;
   RepositoryGateway? _gateway;
+  Future<void>? _connectFuture;
 
   bool isReady = false;
   bool isInitializing = true;
@@ -96,6 +97,7 @@ class AppController extends ChangeNotifier {
   String? defaultQuickSaveDirectory;
   String? photoTransferError;
   int _quickRefreshGeneration = 0;
+  int _quickSessionGeneration = 0;
   bool _isRefreshingQuickTransfer = false;
   bool _quickRefreshPending = false;
   bool _quickRefreshDevicesPending = false;
@@ -103,6 +105,10 @@ class AppController extends ChangeNotifier {
   bool _disposed = false;
   Completer<void>? _quickRefreshIdle;
   Future<void> _quickMutationTail = Future<void>.value();
+  Future<void>? _quickInitializationFuture;
+  Future<void> _quickInitializationTail = Future<void>.value();
+  int? _quickInitializationGeneration;
+  bool _quickInitializationActive = false;
   Timer? _quickMaintenanceTimer;
   DateTime? _lastQuickDeviceRefresh;
   final Map<String, QuickTransferManifest> _quickManifestCache = {};
@@ -200,13 +206,27 @@ class AppController extends ChangeNotifier {
       );
       if (mode == RepositoryMode.sftp) await _loadSftpProfile();
       await connect();
-      await _restorePendingTransfers();
+      if (isReady) unawaited(_restorePendingTransfersSafely());
     } catch (exception) {
       error = describeError(exception);
       isReady = false;
     } finally {
       isInitializing = false;
       notifyListeners();
+    }
+  }
+
+  Future<void> _restorePendingTransfersSafely() async {
+    try {
+      await _restorePendingTransfers();
+    } catch (exception) {
+      // Recovery is intentionally independent from the repository session.
+      // A malformed or temporarily inaccessible history record must not turn
+      // an already connected repository into a failed startup.
+      if (!_disposed) {
+        quickError = describeError(exception);
+        notifyListeners();
+      }
     }
   }
 
@@ -638,20 +658,44 @@ class AppController extends ChangeNotifier {
       needsTailscale = false;
       error = null;
       connectionStatus = RepositoryConnectionStatus.connected;
+      // Repository availability is the primary lifecycle.  Publish it before
+      // any quick-transfer work so the first screen can render immediately.
+      isLoading = false;
+      notifyListeners();
       await previous?.dispose();
       await _stopPhotoTransferServer();
-      await _initializeQuickTransferSafely();
+      unawaited(_initializeQuickTransferSafely());
     } catch (_) {
       await candidate.dispose();
       rethrow;
     } finally {
-      isLoading = false;
-      notifyListeners();
+      if (isLoading) {
+        isLoading = false;
+        notifyListeners();
+      }
     }
   }
 
-  Future<void> connect() async {
-    if (hasActiveTransfers) return;
+  Future<void> connect() {
+    if (hasActiveTransfers) return Future<void>.value();
+    final existing = _connectFuture;
+    if (existing != null) return existing;
+    final operation = _connectInternal();
+    _connectFuture = operation;
+    unawaited(
+      operation.then<void>(
+        (_) {
+          if (identical(_connectFuture, operation)) _connectFuture = null;
+        },
+        onError: (Object _, StackTrace _) {
+          if (identical(_connectFuture, operation)) _connectFuture = null;
+        },
+      ),
+    );
+    return operation;
+  }
+
+  Future<void> _connectInternal() async {
     isLoading = true;
     connectionStatus = isReady
         ? RepositoryConnectionStatus.retrying
@@ -684,7 +728,11 @@ class AppController extends ChangeNotifier {
       isReady = true;
       needsTailscale = false;
       connectionStatus = RepositoryConnectionStatus.connected;
-      await _initializeQuickTransferSafely();
+      isLoading = false;
+      // The repository is usable now.  Do not hold the primary startup or
+      // reconnect spinner open while quick-transfer metadata is prepared.
+      notifyListeners();
+      unawaited(_initializeQuickTransferSafely());
     } catch (exception) {
       error = describeError(exception);
       needsTailscale = _isTailscaleConnectivityError(exception);
@@ -692,33 +740,73 @@ class AppController extends ChangeNotifier {
       isReady = false;
       connectionStatus = RepositoryConnectionStatus.disconnected;
     } finally {
-      isLoading = false;
-      notifyListeners();
+      if (isLoading) {
+        isLoading = false;
+        notifyListeners();
+      }
     }
   }
 
-  Future<void> _initializeQuickTransferSafely() async {
+  Future<void> _initializeQuickTransferSafely() {
+    final existing = _quickInitializationFuture;
+    if (existing != null &&
+        _quickInitializationGeneration == _quickSessionGeneration) {
+      return existing;
+    }
+    final generation = _quickSessionGeneration;
+    final result = _quickInitializationTail.then(
+      (_) => _initializeQuickTransferSafelyInternal(generation),
+    );
+    _quickInitializationFuture = result;
+    _quickInitializationGeneration = generation;
+    _quickInitializationTail = result.catchError((_) {});
+    unawaited(
+      result.then<void>(
+        (_) {
+          if (identical(_quickInitializationFuture, result)) {
+            _quickInitializationFuture = null;
+          }
+        },
+        onError: (Object _, StackTrace _) {
+          if (identical(_quickInitializationFuture, result)) {
+            _quickInitializationFuture = null;
+          }
+        },
+      ),
+    );
+    return result;
+  }
+
+  Future<void> _initializeQuickTransferSafelyInternal(int generation) async {
+    _quickInitializationActive = true;
     try {
-      await _initializeQuickTransfer();
+      await _initializeQuickTransfer(generation);
+      if (generation != _quickSessionGeneration || !isReady) return;
       quickError = null;
       _quickMaintenanceTimer ??= Timer.periodic(
         const Duration(seconds: 45),
         (_) => unawaited(_maintainQuickPresence()),
       );
+      notifyListeners();
     } catch (exception) {
+      if (generation != _quickSessionGeneration || !isReady) return;
       await _stopPhotoTransferServer();
       quickError = describeError(exception);
       notifyListeners();
+    } finally {
+      _quickInitializationActive = false;
     }
   }
 
   Future<void> _maintainQuickPresence() async {
     if (!isReady || hasRunningTransfers) return;
+    final generation = _quickSessionGeneration;
     try {
       await _startPhotoTransferServer();
       await _publishDeviceRegistration();
       await refreshQuickTransfer(refreshDevices: true);
     } catch (exception) {
+      if (generation != _quickSessionGeneration) return;
       quickError = describeError(exception);
       notifyListeners();
     }
@@ -769,8 +857,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> onAppResumed() async {
     if (hasActiveTransfers || isLoading) return;
-    if (!isReady ||
-        connectionStatus == RepositoryConnectionStatus.disconnected) {
+    if (!isReady) {
       await connect();
       return;
     }
@@ -897,15 +984,20 @@ class AppController extends ChangeNotifier {
     return '操作失败。请稍后重试；若持续发生，请检查连接设置和网络状态。';
   }
 
-  Future<void> _initializeQuickTransfer() async {
+  Future<void> _initializeQuickTransfer(int generation) async {
     await _loadQuickIdentity();
+    if (generation != _quickSessionGeneration) return;
     await _startPhotoTransferServer();
-    await _ensureQuickDirectories();
+    if (generation != _quickSessionGeneration) return;
+    await _ensureQuickDirectories(generation: generation);
+    if (generation != _quickSessionGeneration) return;
     await _publishDeviceRegistration();
+    if (generation != _quickSessionGeneration) return;
     await refreshQuickTransfer(refreshDevices: true);
   }
 
   void _invalidateQuickState() {
+    _quickSessionGeneration++;
     _lastQuickDeviceRefresh = null;
     _quickDeviceCache.clear();
     _quickManifestCache.clear();
@@ -945,23 +1037,33 @@ class AppController extends ChangeNotifier {
     await refreshQuickTransfer(refreshDevices: true);
   }
 
-  Future<void> _ensureQuickDirectories() async {
+  Future<void> _ensureQuickDirectories({int? generation}) async {
     final gateway = _gateway;
     if (gateway == null) throw StateError('Repository is not connected.');
-    await _ensureDirectory('', _quickRoot);
-    await _ensureDirectory(_quickRoot, 'devices');
-    await _ensureDirectory(_quickRoot, _quickMessages);
+    await _ensureDirectory('', _quickRoot, gateway: gateway);
+    if (generation != null && generation != _quickSessionGeneration) return;
+    await _ensureDirectory(_quickRoot, 'devices', gateway: gateway);
+    if (generation != null && generation != _quickSessionGeneration) return;
+    await _ensureDirectory(_quickRoot, _quickMessages, gateway: gateway);
   }
 
-  Future<void> _ensureDirectory(String parent, String name) async {
+  Future<void> _ensureDirectory(
+    String parent,
+    String name, {
+    RepositoryGateway? gateway,
+  }) async {
+    final targetGateway = gateway ?? _gateway;
+    if (targetGateway == null) {
+      throw StateError('Repository is not connected.');
+    }
     try {
-      await _gateway!.createDirectory(parent, name);
+      await targetGateway.createDirectory(parent, name);
     } catch (exception, stackTrace) {
       final expected = joinRelativePath(parent, name);
       try {
         // Listing the directory itself validates it even when its name is
         // deliberately hidden from the parent repository view.
-        await _gateway!.listDirectory(expected);
+        await targetGateway.listDirectory(expected);
         return;
       } catch (_) {}
       Error.throwWithStackTrace(exception, stackTrace);
@@ -1219,9 +1321,7 @@ class AppController extends ChangeNotifier {
         final nextForceDeviceRefresh =
             forceDeviceRefresh || _quickRefreshDevicesPending;
         _quickRefreshDevicesPending = false;
-        unawaited(
-          refreshQuickTransfer(refreshDevices: nextForceDeviceRefresh),
-        );
+        unawaited(refreshQuickTransfer(refreshDevices: nextForceDeviceRefresh));
       } else if (!idle.isCompleted) {
         idle.complete();
         if (identical(_quickRefreshIdle, idle)) _quickRefreshIdle = null;
@@ -1702,8 +1802,7 @@ class AppController extends ChangeNotifier {
     QuickDevice? recipient = quickRecipients
         .where((item) => item.id == target)
         .firstOrNull;
-    if (isPhoto &&
-        (recipient == null || !recipient.supportsPhotoTransfer)) {
+    if (isPhoto && (recipient == null || !recipient.supportsPhotoTransfer)) {
       // Device registrations are deliberately cached for ordinary inbox
       // refreshes, but a photo send must confirm the receiver's current
       // capability before creating a running task.  This covers a desktop
@@ -1725,9 +1824,7 @@ class AppController extends ChangeNotifier {
         throw StateError('照片必须同时具有受支持的图片扩展名和 MIME 类型。');
       }
       if (!recipient.supportsPhotoTransfer) {
-        throw const PhotoTransferException(
-          '目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。',
-        );
+        throw const PhotoTransferException('目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。');
       }
       return _publishPhotoTransfer(
         source,
@@ -1800,9 +1897,7 @@ class AppController extends ChangeNotifier {
     required QuickDevice recipient,
   }) async {
     if (!recipient.supportsPhotoTransfer) {
-      throw const PhotoTransferException(
-        '目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。',
-      );
+      throw const PhotoTransferException('目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。');
     }
     final taskId = uniqueSuffix();
     final task = TransferTask(
@@ -2348,6 +2443,7 @@ class AppController extends ChangeNotifier {
       final result = await ConnectionRetry(
         resetConnection: _resetConnection,
         beforeRetry: (_) {
+          if (_quickInitializationActive || _isRefreshingQuickTransfer) return;
           connectionStatus = RepositoryConnectionStatus.retrying;
           notifyListeners();
         },
@@ -2355,9 +2451,10 @@ class AppController extends ChangeNotifier {
       if (isReady) connectionStatus = RepositoryConnectionStatus.connected;
       return result;
     } catch (exception) {
-      if (_isTailscaleConnectivityError(exception) ||
-          exception is SocketException ||
-          exception is TimeoutException) {
+      if (!isReady &&
+          (_isTailscaleConnectivityError(exception) ||
+              exception is SocketException ||
+              exception is TimeoutException)) {
         connectionStatus = RepositoryConnectionStatus.disconnected;
         notifyListeners();
       }
@@ -2503,6 +2600,8 @@ class AppController extends ChangeNotifier {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _quickSessionGeneration++;
+    _quickRefreshGeneration++;
     _quickMaintenanceTimer?.cancel();
     _transferUiTimer?.cancel();
     unawaited(_stopPhotoTransferServer());

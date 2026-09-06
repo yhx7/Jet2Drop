@@ -49,6 +49,23 @@ void main() {
     );
   });
 
+  testWidgets('ready repository does not show the startup spinner', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = true
+      ..isReady = true
+      ..isLoading = false;
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(home: RepositoryPage(controller: controller)),
+    );
+
+    expect(find.text('上传'), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+  });
+
   testWidgets('main product pages keep their primary feature entries', (
     tester,
   ) async {

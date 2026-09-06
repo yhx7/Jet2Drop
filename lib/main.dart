@@ -255,7 +255,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   }
 
   Widget _repositoryView() {
-    if (controller.isInitializing) {
+    if (!controller.isReady && controller.isInitializing) {
       return const Center(child: CircularProgressIndicator());
     }
     if (!controller.isReady) {
@@ -669,8 +669,7 @@ class _RepositoryPageState extends State<RepositoryPage>
           ? _quickTarget
           : (recipients.isEmpty ? null : recipients.first.id);
       return RefreshIndicator(
-        onRefresh: () =>
-            controller.refreshQuickTransfer(refreshDevices: true),
+        onRefresh: () => controller.refreshQuickTransfer(refreshDevices: true),
         child: ListView(
           padding: EdgeInsets.all(compact ? 16 : 28),
           children: [
@@ -691,9 +690,8 @@ class _RepositoryPageState extends State<RepositoryPage>
                 ),
                 IconButton(
                   tooltip: '刷新设备与收件箱',
-                  onPressed: () => controller.refreshQuickTransfer(
-                    refreshDevices: true,
-                  ),
+                  onPressed: () =>
+                      controller.refreshQuickTransfer(refreshDevices: true),
                   icon: const Icon(Icons.refresh),
                 ),
               ],
