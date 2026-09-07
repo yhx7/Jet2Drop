@@ -7,6 +7,7 @@ import 'package:jet2drop/app_controller.dart';
 import 'package:jet2drop/core/models/quick_device.dart';
 import 'package:jet2drop/core/models/transfer_task.dart';
 import 'package:jet2drop/core/photo_transfer.dart';
+import 'package:jet2drop/core/quick_transfer.dart';
 import 'package:jet2drop/core/transfer_control.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -850,6 +851,269 @@ void main() {
           '${Platform.pathSeparator}messages${Platform.pathSeparator}${manifest.id}',
         ).exists(),
         isFalse,
+      );
+    },
+  );
+
+  test(
+    'confirmed quick deletion removes the row before remote cleanup finishes',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-quick-delete-ui-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final manifest = QuickTransferManifest(
+        id: 'delete-before-remote',
+        name: 'payload.bin',
+        size: 1,
+        sha256: 'checksum',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        chunkSize: 1,
+        senderDevice: controller.deviceId,
+        targetDevice: 'target-device',
+      );
+      controller.quickInbox = [manifest];
+
+      final deletion = controller.deleteQuickTransfer(manifest);
+
+      expect(
+        controller.quickInbox.any((item) => item.id == manifest.id),
+        isFalse,
+      );
+      await deletion;
+    },
+  );
+
+  test(
+    'a manifest removed during refresh drops the stale row without quick error',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-quick-stale-manifest-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final package = Directory(
+        '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+        '${Platform.pathSeparator}messages${Platform.pathSeparator}stale-record',
+      );
+      await package.create(recursive: true);
+      final manifest = QuickTransferManifest(
+        id: 'stale-record',
+        name: 'payload.bin',
+        size: 1,
+        sha256: 'checksum',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        chunkSize: 1,
+        senderDevice: controller.deviceId,
+        targetDevice: 'target-device',
+      );
+      final manifestFile = File(
+        '${package.path}${Platform.pathSeparator}manifest.json',
+      );
+      await manifestFile.writeAsString(jsonEncode(manifest.toJson()));
+
+      await controller.refreshQuickTransfer(refreshDevices: true);
+      expect(
+        controller.quickInbox.any((item) => item.id == manifest.id),
+        isTrue,
+      );
+
+      await manifestFile.delete();
+      // Recreate the package directory so its metadata changes as it would
+      // after a remote package is removed/re-published.
+      await package.delete(recursive: true);
+      await package.create(recursive: true);
+      await controller.refreshQuickTransfer();
+
+      expect(
+        controller.quickInbox.any((item) => item.id == manifest.id),
+        isFalse,
+      );
+      expect(controller.quickError, isNull);
+    },
+  );
+
+  test('a quick record cannot be claimed concurrently twice', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'jet2drop-quick-double-claim-',
+    );
+    addTearDown(() => root.delete(recursive: true));
+    final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+    await repository.create();
+    final controller = await createController(repository);
+    addTearDown(controller.dispose);
+    final package = Directory(
+      '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+      '${Platform.pathSeparator}messages${Platform.pathSeparator}double-claim',
+    );
+    await package.create(recursive: true);
+    final payload = File(
+      '${package.path}${Platform.pathSeparator}payload.bin',
+    );
+    await payload.writeAsBytes([7]);
+    final validChecksum = await QuickTransferService().checksum(payload);
+    final manifest = QuickTransferManifest(
+      id: 'double-claim',
+      name: 'payload.bin',
+      size: 1,
+      sha256: validChecksum,
+      createdAt: DateTime.now().toUtc(),
+      expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      chunkSize: 1,
+      senderDevice: 'sender-device',
+      targetDevice: controller.deviceId,
+    );
+    await File(
+      '${package.path}${Platform.pathSeparator}manifest.json',
+    ).writeAsString(jsonEncode(manifest.toJson()));
+
+    final first = controller.receiveQuickTransfer(
+      manifest,
+      target: File('${root.path}${Platform.pathSeparator}first.bin'),
+    );
+    expect(controller.isQuickTransferReceiving(manifest.id), isTrue);
+    await expectLater(
+      controller.receiveQuickTransfer(
+        manifest,
+        target: File('${root.path}${Platform.pathSeparator}second.bin'),
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('正在领取'),
+        ),
+      ),
+    );
+    await first;
+    expect(controller.isQuickTransferReceiving(manifest.id), isFalse);
+  });
+
+  test(
+    'an unclaimed record with a missing payload remains an explicit failure',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-quick-missing-payload-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final package = Directory(
+        '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+        '${Platform.pathSeparator}messages${Platform.pathSeparator}missing-payload',
+      );
+      await package.create(recursive: true);
+      final manifest = QuickTransferManifest(
+        id: 'missing-payload',
+        name: 'payload.bin',
+        size: 1,
+        sha256: 'checksum',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        chunkSize: 1,
+        senderDevice: 'sender-device',
+        targetDevice: controller.deviceId,
+      );
+      await File(
+        '${package.path}${Platform.pathSeparator}manifest.json',
+      ).writeAsString(jsonEncode(manifest.toJson()));
+      await controller.refreshQuickTransfer();
+
+      await expectLater(
+        controller.receiveQuickTransfer(
+          manifest,
+          target: File('${root.path}${Platform.pathSeparator}missing.bin'),
+        ),
+        throwsA(isA<FileSystemException>()),
+      );
+      expect(controller.quickError, isNull);
+      expect(
+        controller.quickInbox.any((item) => item.id == manifest.id),
+        isTrue,
+      );
+      expect(
+        controller.tasks
+            .singleWhere((task) => task.name == manifest.name)
+            .error,
+        contains('文件不存在或已被移动'),
+      );
+    },
+  );
+
+  test(
+    'a missing payload with a durable receipt converges without an error',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'jet2drop-quick-claimed-payload-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final controller = await createController(repository);
+      addTearDown(controller.dispose);
+      final package = Directory(
+        '${repository.path}${Platform.pathSeparator}__jet2drop_transfer'
+        '${Platform.pathSeparator}messages${Platform.pathSeparator}claimed-payload',
+      );
+      await package.create(recursive: true);
+      final manifest = QuickTransferManifest(
+        id: 'claimed-payload',
+        name: 'payload.bin',
+        size: 1,
+        sha256: 'checksum',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        chunkSize: 1,
+        senderDevice: 'sender-device',
+        targetDevice: controller.deviceId,
+      );
+      final claimed = manifest.copyWith(
+        claimedAt: DateTime.now().toUtc(),
+        claimedBy: controller.deviceId,
+      );
+      await File(
+        '${package.path}${Platform.pathSeparator}manifest.json',
+      ).writeAsString(jsonEncode(manifest.toJson()));
+      await File(
+        '${package.path}${Platform.pathSeparator}receipt.json',
+      ).writeAsString(jsonEncode(claimed.toJson()));
+      // Simulate a stale unclaimed row that was rendered before the receipt
+      // became visible to this device.
+      controller.quickInbox = [manifest];
+
+      final saved = await controller.receiveQuickTransfer(
+        manifest,
+        target: File('${root.path}${Platform.pathSeparator}claimed.bin'),
+      );
+
+      expect(saved, isFalse);
+      expect(controller.quickError, isNull);
+      expect(
+        controller.quickInbox.any((item) => item.id == manifest.id),
+        isTrue,
+      );
+      final visible = controller.quickInbox.singleWhere(
+        (item) => item.id == manifest.id,
+      );
+      expect(visible.isClaimed, isTrue);
+      expect(visible.claimedAt, claimed.claimedAt);
+      expect(visible.claimedBy, claimed.claimedBy);
+      expect(
+        controller.tasks
+            .singleWhere((task) => task.name == manifest.name)
+            .status,
+        TransferStatus.cancelled,
       );
     },
   );

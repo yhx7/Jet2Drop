@@ -36,6 +36,12 @@ class SftpRepositoryGateway implements RepositoryGateway {
   SftpClient? _sftp;
 
   static const _operationTimeout = Duration(seconds: 45);
+  // SFTP's default 16 KiB reads turn a high-latency relay into thousands of
+  // tiny round trips. dartssh2 recommends this 64 KiB/128-request pipeline
+  // for high-latency links. The library still yields chunks in file order, so
+  // pause/cancel/checksum/atomic-publish semantics remain unchanged.
+  static const _downloadChunkSize = 64 * 1024;
+  static const _downloadPendingRequests = 128;
 
   Future<T> _withOperationTimeout<T>(Future<T> operation, String action) =>
       operation.timeout(
@@ -420,9 +426,17 @@ class SftpRepositoryGateway implements RepositoryGateway {
     final sink = temporary.openWrite(
       mode: written == 0 ? FileMode.write : FileMode.append,
     );
-    final handle = await sftp.open(remote, mode: SftpFileOpenMode.read);
+    SftpFile? handle;
     final checksum = onChecksum == null ? null : Sha256Accumulator();
     try {
+      // Keep opening the remote handle inside the cleanup boundary. If the
+      // target disappears between stat and open, the local partial sink must
+      // still be closed so a retry can safely reuse it.
+      final openedHandle = await _withOperationTimeout(
+        sftp.open(remote, mode: SftpFileOpenMode.read),
+        'Preparing download',
+      );
+      handle = openedHandle;
       if (checksum != null && written > 0) {
         await for (final chunk in temporary.openRead(0, written)) {
           checksum.add(chunk);
@@ -430,8 +444,13 @@ class SftpRepositoryGateway implements RepositoryGateway {
       }
       onProgress?.call(written, total);
       await for (final chunk
-          in handle
-              .read(offset: written)
+          in openedHandle
+              .read(
+                length: total - written,
+                offset: written,
+                chunkSize: _downloadChunkSize,
+                maxPendingRequests: _downloadPendingRequests,
+              )
               .timeout(
                 _operationTimeout,
                 onTimeout: (sink) => sink.addError(
@@ -449,7 +468,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
       await sink.flush();
       await sink.close();
       if (checksum != null) onChecksum!(checksum.close());
-      await handle.close();
+      await _withOperationTimeout(openedHandle.close(), 'Finalizing download');
       await control?.checkpoint();
       final backup = File('${target.path}.jet2drop-backup-${uniqueSuffix()}');
       final hadTarget = await target.exists();
@@ -468,8 +487,12 @@ class SftpRepositoryGateway implements RepositoryGateway {
         } catch (_) {}
       }
     } catch (exception) {
-      await sink.close();
-      await handle.close();
+      try {
+        await sink.close();
+      } catch (_) {}
+      try {
+        await handle?.close();
+      } catch (_) {}
       if ((resumeId == null ||
               exception is TransferCancelled ||
               control?.isCancelled == true) &&

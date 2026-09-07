@@ -900,8 +900,12 @@ class _RepositoryPageState extends State<RepositoryPage>
             )
           else if (controller.canClaimQuickTransfer(manifest))
             IconButton(
-              tooltip: '领取并保存',
-              onPressed: () => _claimQuickTransfer(manifest),
+              tooltip: controller.isQuickTransferReceiving(manifest.id)
+                  ? '正在领取'
+                  : '领取并保存',
+              onPressed: controller.isQuickTransferReceiving(manifest.id)
+                  ? null
+                  : () => _claimQuickTransfer(manifest),
               icon: const Icon(Icons.download_outlined),
             )
           else
@@ -924,6 +928,11 @@ class _RepositoryPageState extends State<RepositoryPage>
       key: ValueKey('quick-transfer-${manifest.id}'),
       direction: DismissDirection.endToStart,
       confirmDismiss: (_) => _confirmDeleteQuickTransfer(manifest),
+      // The controller removes the item optimistically as soon as deletion is
+      // confirmed. Keep the completion callback present so Dismissible can
+      // finish its resize lifecycle even if a slow repository delete is still
+      // running in the background.
+      onDismissed: (_) {},
       background: Container(
         alignment: Alignment.centerRight,
         padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -966,13 +975,21 @@ class _RepositoryPageState extends State<RepositoryPage>
       ),
     );
     if (confirmed != true) return false;
+    // Dismissible must receive its answer immediately. Waiting for remote
+    // deletion and the follow-up refresh leaves the Android row stranded on
+    // its red background whenever the network is slow.
+    unawaited(_deleteQuickTransferInBackground(manifest));
+    return true;
+  }
+
+  Future<void> _deleteQuickTransferInBackground(
+    QuickTransferManifest manifest,
+  ) async {
     try {
       await controller.deleteQuickTransfer(manifest);
       if (mounted) _message('已删除');
-      return true;
     } catch (exception) {
       if (mounted) _message('删除失败：${controller.describeError(exception)}');
-      return false;
     }
   }
 
@@ -1125,25 +1142,25 @@ class _RepositoryPageState extends State<RepositoryPage>
         '${temporary.path}${Platform.pathSeparator}${manifest.id}-${manifest.name}',
       );
       try {
-        await controller.receiveQuickTransfer(
+        final saved = await controller.receiveQuickTransfer(
           manifest,
           target: target,
           androidTargetUri: documentTarget,
           saveAsMedia: isMedia,
           mimeType: mimeType,
         );
-        if (mounted) _message('文件已保存');
+        if (saved && mounted) _message('文件已保存');
       } catch (exception) {
         if (mounted) _message('领取失败：${controller.describeError(exception)}');
       }
       return;
     }
     try {
-      await controller.receiveQuickTransfer(
+      final saved = await controller.receiveQuickTransfer(
         manifest,
         target: await controller.defaultQuickReceiveTarget(manifest.name),
       );
-      if (mounted) _message('文件已保存');
+      if (saved && mounted) _message('文件已保存');
     } catch (exception) {
       if (mounted) _message('领取失败：${controller.describeError(exception)}');
     }

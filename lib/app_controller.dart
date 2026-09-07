@@ -126,8 +126,7 @@ class AppController extends ChangeNotifier {
   DateTime? _lastQuickDeviceRefresh;
   final Map<String, QuickTransferManifest> _quickManifestCache = {};
   final Set<String> _hiddenQuickTransferIds = {};
-  final Map<String, ({DateTime modifiedAt, QuickDevice device})>
-  _quickDeviceCache = {};
+  final Set<String> _quickReceivingIds = {};
   String deviceId = '';
   String deviceName = '';
   List<QuickDevice> quickDevices = const [];
@@ -152,7 +151,9 @@ class AppController extends ChangeNotifier {
         isReady &&
         deviceId.isNotEmpty &&
         !_quickInitializationActive) {
-      unawaited(refreshQuickTransfer(refreshDevices: true));
+      // Keep the active message poll cheap. Device registrations are
+      // reread only when the caller explicitly requests a device refresh.
+      unawaited(refreshQuickTransfer());
     }
   }
 
@@ -187,7 +188,10 @@ class AppController extends ChangeNotifier {
     if (presenceDue) {
       unawaited(_maintainQuickPresence());
     } else {
-      unawaited(refreshQuickTransfer(refreshDevices: true));
+      // The 15-second active-page tick only needs message state. Presence
+      // maintenance performs the less frequent device refresh every 45
+      // seconds, while explicit actions can still force an immediate reread.
+      unawaited(refreshQuickTransfer());
     }
   }
 
@@ -239,6 +243,9 @@ class AppController extends ChangeNotifier {
 
   bool canClaimQuickTransfer(QuickTransferManifest manifest) =>
       !manifest.isClaimed && manifest.targetDevice == deviceId;
+
+  bool isQuickTransferReceiving(String transferId) =>
+      _quickReceivingIds.contains(transferId);
 
   bool canRetryTask(TransferTask task) => _retryActions.containsKey(task.id);
 
@@ -1002,6 +1009,107 @@ class AppController extends ChangeNotifier {
         message.contains('network is unreachable');
   }
 
+  bool _isMissingFileError(Object exception) {
+    if (exception is FileSystemException) {
+      final code = exception.osError?.errorCode;
+      if (code == 2 || code == 3) return true;
+    }
+    final normalized = exception.toString().toLowerCase();
+    return normalized.contains('no such file') ||
+        normalized.contains('file not found') ||
+        normalized.contains('path not found') ||
+        normalized.contains('does not exist');
+  }
+
+  Future<_QuickPayloadInspection> _inspectMissingQuickPayload(
+    String messagePath,
+  ) async {
+    final gateway = _gateway;
+    if (gateway == null) {
+      return (state: _QuickPayloadState.unknown, claimedManifest: null);
+    }
+    try {
+      if (mode == RepositoryMode.local) {
+        final safePath = normalizeRelativePath(messagePath);
+        final package = Directory(
+          '$localRoot${Platform.pathSeparator}${safePath.replaceAll('/', Platform.pathSeparator)}',
+        );
+        if (!await package.exists()) {
+          return (state: _QuickPayloadState.removed, claimedManifest: null);
+        }
+      }
+      final entries = await _retryOperation(
+        () => gateway.listDirectory(messagePath),
+      );
+      if (!entries.any((entry) => entry.name == 'receipt.json')) {
+        return (state: _QuickPayloadState.missing, claimedManifest: null);
+      }
+      try {
+        final receipt = await _readQuickText('$messagePath/receipt.json');
+        final claimed = QuickTransferManifest.fromJson(
+          jsonDecode(receipt) as Map<String, dynamic>,
+        );
+        return claimed.isClaimed
+            ? (state: _QuickPayloadState.claimed, claimedManifest: claimed)
+            : (state: _QuickPayloadState.missing, claimedManifest: null);
+      } catch (exception) {
+        return _isMissingFileError(exception)
+            ? (state: _QuickPayloadState.missing, claimedManifest: null)
+            : (state: _QuickPayloadState.unknown, claimedManifest: null);
+      }
+    } catch (exception) {
+      // A missing package means another participant already removed the
+      // record. Connection/permission errors are deliberately left unknown
+      // so a real missing payload remains an actionable failure.
+      return _isMissingFileError(exception)
+          ? (state: _QuickPayloadState.removed, claimedManifest: null)
+          : (state: _QuickPayloadState.unknown, claimedManifest: null);
+    }
+  }
+
+  void _hideQuickTransfer(String transferId) {
+    _hiddenQuickTransferIds.add(transferId);
+    _quickManifestCache.remove(
+      '$_quickRoot/$_quickMessages/$transferId/manifest.json',
+    );
+    _removeQuickInboxItem(transferId);
+  }
+
+  String? _quickTransferIdFromManifestPath(String path) {
+    const suffix = '/manifest.json';
+    if (!path.endsWith(suffix)) return null;
+    final packagePath = path.substring(0, path.length - suffix.length);
+    final separator = packagePath.lastIndexOf('/');
+    if (separator < 0 || separator == packagePath.length - 1) return null;
+    return packagePath.substring(separator + 1);
+  }
+
+  void _removeQuickInboxItem(String transferId) {
+    final filtered = quickInbox
+        .where((item) => item.id != transferId)
+        .toList(growable: false);
+    if (filtered.length == quickInbox.length) return;
+    quickInbox = filtered;
+    notifyListeners();
+  }
+
+  void _replaceQuickInboxItem(QuickTransferManifest replacement) {
+    var replaced = false;
+    final updated = quickInbox
+        .map((item) {
+          if (item.id != replacement.id) return item;
+          replaced = true;
+          return replacement;
+        })
+        .toList(growable: false);
+    if (!replaced) return;
+    quickInbox = updated;
+    _quickManifestCache[
+      '$_quickRoot/$_quickMessages/${replacement.id}/manifest.json'
+    ] = replacement;
+    notifyListeners();
+  }
+
   /// Converts implementation exceptions into safe, actionable user messages.
   /// Raw exception details are deliberately never presented in the UI.
   String describeError(Object exception) {
@@ -1097,7 +1205,6 @@ class AppController extends ChangeNotifier {
     _stopQuickMaintenanceTimer();
     _lastQuickPresenceUpdate = null;
     _lastQuickDeviceRefresh = null;
-    _quickDeviceCache.clear();
     _quickManifestCache.clear();
     quickDevices = const [];
     quickInbox = const [];
@@ -1263,27 +1370,15 @@ class AppController extends ChangeNotifier {
               const Duration(minutes: 1);
       if (shouldRefreshDevices) {
         final discovered = <QuickDevice>[];
-        final visibleDevicePaths = <String>{};
         try {
           for (final entry in await _retryOperation(
             () => gateway.listDirectory('$_quickRoot/devices'),
           )) {
             if (entry.isDirectory || !entry.name.endsWith('.json')) continue;
-            visibleDevicePaths.add(entry.path);
             try {
-              final cached = _quickDeviceCache[entry.path];
-              final device =
-                  !shouldRefreshDevices &&
-                      cached != null &&
-                      cached.modifiedAt == entry.modifiedAt
-                  ? cached.device
-                  : QuickDevice.fromJson(
-                      jsonDecode(await _readQuickText(entry.path))
-                          as Map<String, dynamic>,
-                    );
-              _quickDeviceCache[entry.path] = (
-                modifiedAt: entry.modifiedAt,
-                device: device,
+              final device = QuickDevice.fromJson(
+                jsonDecode(await _readQuickText(entry.path))
+                    as Map<String, dynamic>,
               );
               final age = DateTime.now().difference(device.updatedAt);
               if (age < const Duration(hours: 24)) discovered.add(device);
@@ -1296,9 +1391,6 @@ class AppController extends ChangeNotifier {
               }
             } catch (_) {}
           }
-          _quickDeviceCache.removeWhere(
-            (path, _) => !visibleDevicePaths.contains(path),
-          );
         } catch (_) {
           // Device names are optional metadata. Continue loading messages.
         }
@@ -1339,7 +1431,13 @@ class AppController extends ChangeNotifier {
         }
         for (final manifestPath in manifestPaths) {
           try {
-            final cached = _quickManifestCache[manifestPath];
+            // Local repository reads do not pay a network round trip, so
+            // always observe the current manifest there. SFTP keeps the
+            // cache because the package directory listing is the authoritative
+            // change signal and each manifest read costs another relay RTT.
+            final cached = mode == RepositoryMode.sftp
+                ? _quickManifestCache[manifestPath]
+                : null;
             var value =
                 cached ??
                 QuickTransferManifest.fromJson(
@@ -1351,20 +1449,23 @@ class AppController extends ChangeNotifier {
                       as Map<String, dynamic>,
                 );
             _quickManifestCache[manifestPath] = value;
-            final receiptPath = manifestPath.replaceFirst(
-              '/manifest.json',
-              '/receipt.json',
-            );
-            try {
-              final receipt = await _readQuickText(
-                receiptPath,
-              ).timeout(const Duration(seconds: 5));
-              value = QuickTransferManifest.fromJson(
-                jsonDecode(receipt) as Map<String, dynamic>,
+            if (!value.isClaimed) {
+              final receiptPath = manifestPath.replaceFirst(
+                '/manifest.json',
+                '/receipt.json',
               );
-              _quickManifestCache[manifestPath] = value;
-            } catch (_) {
-              // A receipt is optional until the target device saves the file.
+              try {
+                final receipt = await _readQuickText(
+                  receiptPath,
+                ).timeout(const Duration(seconds: 5));
+                value = QuickTransferManifest.fromJson(
+                  jsonDecode(receipt) as Map<String, dynamic>,
+                );
+                _quickManifestCache[manifestPath] = value;
+              } catch (_) {
+                // A receipt is optional until the target device saves the
+                // file.
+              }
             }
             if (value.expiresAt.isBefore(DateTime.now().toUtc())) {
               await _retryOperation(
@@ -1382,8 +1483,18 @@ class AppController extends ChangeNotifier {
                     value.targetDevice == deviceId)) {
               inbox.add(value);
             }
-          } catch (_) {
-            // An incomplete package is not published until its manifest exists.
+          } catch (exception, stackTrace) {
+            if (_isMissingFileError(exception)) {
+              // A package directory can outlive its manifest while another
+              // participant is publishing or deleting it. Drop only this
+              // stale cache/list item; a real connection error remains
+              // visible through the normal quick-transfer error path.
+              _quickManifestCache.remove(manifestPath);
+              final transferId = _quickTransferIdFromManifestPath(manifestPath);
+              if (transferId != null) _removeQuickInboxItem(transferId);
+              continue;
+            }
+            Error.throwWithStackTrace(exception, stackTrace);
           }
         }
         _quickManifestCache.removeWhere(
@@ -2214,7 +2325,38 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> receiveQuickTransfer(
+  Future<bool> receiveQuickTransfer(
+    QuickTransferManifest manifest, {
+    required File target,
+    bool finalize = true,
+    void Function(TransferTask task)? onTaskCreated,
+    Future<void> Function(File file)? saveTarget,
+    String? androidTargetUri,
+    bool saveAsMedia = false,
+    String mimeType = 'application/octet-stream',
+  }) async {
+    if (!_quickReceivingIds.add(manifest.id)) {
+      throw StateError('该文件正在领取，请稍候。');
+    }
+    notifyListeners();
+    try {
+      return await _receiveQuickTransfer(
+        manifest,
+        target: target,
+        finalize: finalize,
+        onTaskCreated: onTaskCreated,
+        saveTarget: saveTarget,
+        androidTargetUri: androidTargetUri,
+        saveAsMedia: saveAsMedia,
+        mimeType: mimeType,
+      );
+    } finally {
+      _quickReceivingIds.remove(manifest.id);
+      notifyListeners();
+    }
+  }
+
+  Future<bool> _receiveQuickTransfer(
     QuickTransferManifest manifest, {
     required File target,
     bool finalize = true,
@@ -2291,6 +2433,7 @@ class AppController extends ChangeNotifier {
     if (task.status == TransferStatus.failed) {
       throw StateError(task.error ?? 'Quick transfer failed.');
     }
+    return task.status == TransferStatus.completed;
   }
 
   Future<void> _saveAndroidQuickTarget(
@@ -2332,6 +2475,7 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     Directory? staging;
     var completed = false;
+    var remotePayloadMissing = false;
     try {
       if (!_quickLocallySaved.contains(task.id)) {
         var alreadyDownloaded =
@@ -2341,7 +2485,6 @@ class AppController extends ChangeNotifier {
               await quickTransfer.checksum(target) == manifest.sha256;
         }
         if (!alreadyDownloaded) {
-          await _resetConnection();
           final support = await getApplicationSupportDirectory();
           staging = Directory(
             '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
@@ -2360,19 +2503,24 @@ class AppController extends ChangeNotifier {
             }
           };
           final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
-          await _retryOperation(
-            () => _gateway!.downloadFile(
-              remotePath: '$remotePackage/payload.bin',
-              target: payload,
-              resumeId: manifest.id,
-              onChecksum: (value) => downloadedChecksum = value,
-              control: control,
-              onProgress: (current, _) {
-                task.transferredBytes = current;
-                _notifyTransferProgress();
-              },
-            ),
-          );
+          try {
+            await _retryOperation(
+              () => _gateway!.downloadFile(
+                remotePath: '$remotePackage/payload.bin',
+                target: payload,
+                resumeId: manifest.id,
+                onChecksum: (value) => downloadedChecksum = value,
+                control: control,
+                onProgress: (current, _) {
+                  task.transferredBytes = current;
+                  _notifyTransferProgress();
+                },
+              ),
+            );
+          } catch (exception) {
+            remotePayloadMissing = _isMissingFileError(exception);
+            rethrow;
+          }
           await control.checkpoint();
           task.status = TransferStatus.finalizing;
           notifyListeners();
@@ -2407,6 +2555,42 @@ class AppController extends ChangeNotifier {
       _cleanupActions.remove(task.id);
       await _forgetPending(task.id);
     } catch (exception) {
+      if (remotePayloadMissing && !task.cancelRequested) {
+        final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
+        final inspection = await _inspectMissingQuickPayload(messagePath);
+        if (inspection.state == _QuickPayloadState.removed) {
+          // The package can remain visible briefly after another participant
+          // removed it. This is a terminal stale record, not a failed
+          // transfer. Converge this device's list and task state immediately;
+          // do not turn the expected race into a red error.
+          _hideQuickTransfer(manifest.id);
+          task
+            ..status = TransferStatus.cancelled
+            ..cancelRequested = true
+            ..error = null;
+          _reservedQuickReceivePaths.remove(target.path.toLowerCase());
+          _cleanupActions.remove(task.id);
+          _retryActions.remove(task.id);
+          await _forgetPending(task.id);
+          return;
+        }
+        if (inspection.state == _QuickPayloadState.claimed &&
+            inspection.claimedManifest != null) {
+          // A claimed receipt is durable history. Keep the row visible and
+          // replace its stale unclaimed snapshot so the UI shows who claimed
+          // it, without reporting a successful save on this device.
+          _replaceQuickInboxItem(inspection.claimedManifest!);
+          task
+            ..status = TransferStatus.cancelled
+            ..cancelRequested = true
+            ..error = null;
+          _reservedQuickReceivePaths.remove(target.path.toLowerCase());
+          _cleanupActions.remove(task.id);
+          _retryActions.remove(task.id);
+          await _forgetPending(task.id);
+          return;
+        }
+      }
       if (!task.cancelRequested) {
         task.status = TransferStatus.failed;
         task.error = _quickLocallySaved.contains(task.id)
@@ -2440,7 +2624,6 @@ class AppController extends ChangeNotifier {
       claimed.toJson(),
     );
     try {
-      await _resetConnection();
       final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
       await _retryOperation(
         () => _gateway!.uploadFile(
@@ -2470,14 +2653,38 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> deleteQuickTransfer(QuickTransferManifest manifest) {
+    if (manifest.senderDevice != deviceId &&
+        manifest.targetDevice != deviceId) {
+      return Future<void>.error(
+        StateError('This device is not a participant in the transfer.'),
+      );
+    }
+
+    // Remove the row synchronously after confirmation. Dismissible cannot
+    // finish its animation while the UI waits for a slow SFTP delete. Keep a
+    // snapshot of only this item so a failed remote operation can restore it
+    // without resurrecting other rows that may have been deleted meanwhile.
+    final previous = quickInbox.where((item) => item.id == manifest.id);
+    final previousItem = previous.firstOrNull;
+    if (previousItem != null) {
+      _hiddenQuickTransferIds.add(manifest.id);
+      _quickRefreshGeneration++;
+      quickInbox = quickInbox
+          .where((item) => item.id != manifest.id)
+          .toList(growable: false);
+      notifyListeners();
+    }
     final result = _quickMutationTail.then(
-      (_) => _deleteQuickTransferNow(manifest),
+      (_) => _deleteQuickTransferNow(manifest, previousItem: previousItem),
     );
     _quickMutationTail = result.then<void>((_) {}, onError: (_, _) {});
     return result;
   }
 
-  Future<void> _deleteQuickTransferNow(QuickTransferManifest manifest) async {
+  Future<void> _deleteQuickTransferNow(
+    QuickTransferManifest manifest, {
+    QuickTransferManifest? previousItem,
+  }) async {
     if (manifest.senderDevice != deviceId &&
         manifest.targetDevice != deviceId) {
       throw StateError('This device is not a participant in the transfer.');
@@ -2490,16 +2697,8 @@ class AppController extends ChangeNotifier {
         _quickRefreshGeneration++;
         await refreshIdle.future;
       }
-      final previous = quickInbox;
-      _hiddenQuickTransferIds.add(manifest.id);
-      _quickRefreshGeneration++;
-      quickInbox = previous
-          .where((item) => item.id != manifest.id)
-          .toList(growable: false);
-      notifyListeners();
       final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
       try {
-        await _resetConnection();
         try {
           await _retryOperation(
             () => _gateway!.deleteEntry(messagePath, recursive: true),
@@ -2521,8 +2720,13 @@ class AppController extends ChangeNotifier {
         _quickManifestCache.remove('$messagePath/manifest.json');
       } catch (_) {
         _hiddenQuickTransferIds.remove(manifest.id);
-        quickInbox = previous;
-        notifyListeners();
+        if (previousItem != null &&
+            !quickInbox.any((item) => item.id == previousItem.id)) {
+          final restored = [...quickInbox, previousItem]
+            ..sort((left, right) => right.createdAt.compareTo(left.createdAt));
+          quickInbox = restored;
+          notifyListeners();
+        }
         rethrow;
       }
       _hiddenQuickTransferIds.remove(manifest.id);
@@ -2742,3 +2946,10 @@ class _DurableSource {
     if (owned && await file.exists()) await file.delete();
   }
 }
+
+typedef _QuickPayloadInspection = ({
+  _QuickPayloadState state,
+  QuickTransferManifest? claimedManifest,
+});
+
+enum _QuickPayloadState { missing, removed, claimed, unknown }
