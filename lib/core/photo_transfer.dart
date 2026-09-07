@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
-
 import 'checksum.dart';
 import 'path_utils.dart';
 import 'repository_gateway.dart';
@@ -15,20 +13,8 @@ import 'transfer_control.dart';
 const photoTransferPath = '/v1/photo';
 const photoTransferMaxBytes = 10 * 1024 * 1024 * 1024;
 
-const _photoMimeByExtension = <String, String>{
-  'jpg': 'image/jpeg',
-  'jpeg': 'image/jpeg',
-  'png': 'image/png',
-  'webp': 'image/webp',
-  'gif': 'image/gif',
-  'bmp': 'image/bmp',
-  'heic': 'image/heic',
-  'heif': 'image/heif',
-  'avif': 'image/avif',
-};
-
 String? photoMimeTypeForName(String name) =>
-    _photoMimeByExtension[_photoExtension(name)];
+    isPhotoFileName(name) ? mimeTypeForName(name) : null;
 
 bool isSupportedPhotoTransfer({
   required String name,
@@ -36,15 +22,11 @@ bool isSupportedPhotoTransfer({
 }) {
   final expected = photoMimeTypeForName(name);
   if (expected == null || mimeType == null) return false;
-  final actual = mimeType.split(';').first.trim().toLowerCase();
+  final actual = normalizeMimeType(mimeType);
   if (actual == expected) return true;
-  return (_photoExtension(name) == 'heic' && actual == 'image/heif') ||
-      (_photoExtension(name) == 'heif' && actual == 'image/heic');
-}
-
-String _photoExtension(String name) {
-  final dot = name.lastIndexOf('.');
-  return dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
+  final extension = fileExtension(name);
+  return (extension == 'heic' && actual == 'image/heif') ||
+      (extension == 'heif' && actual == 'image/heic');
 }
 
 class PhotoTransferReceipt {
@@ -173,29 +155,28 @@ class PhotoTransferServer {
       partial = File('${target.path}.jet2drop-photo-${uniqueSuffix()}.part');
       final sink = partial.openWrite();
       var received = 0;
-      final digestSink = _DigestSink();
-      final hashing = sha256.startChunkedConversion(digestSink);
+      final checksum = Sha256Accumulator();
       try {
         await for (final chunk in request) {
           received += chunk.length;
           if (received > size) {
             throw const PhotoTransferException('照片数据超过声明大小。');
           }
-          hashing.add(chunk);
+          checksum.add(chunk);
           sink.add(chunk);
         }
         await sink.flush();
       } finally {
-        await sink.close();
-        hashing.close();
+        try {
+          await sink.close();
+        } finally {
+          checksum.close();
+        }
       }
       if (received != size) {
         throw const PhotoTransferException('照片传输未完整结束。');
       }
-      final checksum = digestSink.value?.toString();
-      if (checksum == null) {
-        throw const PhotoTransferException('照片校验失败。');
-      }
+      final checksumValue = checksum.close();
       await partial.rename(target.path);
       partial = null;
       await _respond(
@@ -204,7 +185,7 @@ class PhotoTransferServer {
         jsonEncode({
           'name': target.uri.pathSegments.last,
           'size': size,
-          'sha256': checksum,
+          'sha256': checksumValue,
         }),
       );
     } on PhotoTransferException catch (exception) {
@@ -424,14 +405,4 @@ class PhotoTransferClient {
   }
 
   Future<void> dispose() async => _httpClient.close(force: true);
-}
-
-class _DigestSink implements Sink<Digest> {
-  Digest? value;
-
-  @override
-  void add(Digest event) => value = event;
-
-  @override
-  void close() {}
 }

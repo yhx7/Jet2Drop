@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import '../core/path_utils.dart';
+
 class PickedMedia {
   const PickedMedia({
     required this.file,
@@ -28,7 +30,7 @@ class AndroidMediaPicker {
             return PickedMedia(
               file: file,
               name: file.uri.pathSegments.last,
-              mimeType: _mimeTypeForName(file.uri.pathSegments.last),
+              mimeType: mimeTypeForName(file.uri.pathSegments.last),
             );
           }
           final map = Map<Object?, Object?>.from(value as Map);
@@ -39,7 +41,7 @@ class AndroidMediaPicker {
             name: map['name'] as String? ?? file.uri.pathSegments.last,
             mimeType:
                 map['mimeType'] as String? ??
-                _mimeTypeForName(map['name'] as String? ?? path),
+                mimeTypeForName(map['name'] as String? ?? path),
           );
         })
         .toList(growable: false);
@@ -50,23 +52,5 @@ class AndroidMediaPicker {
     await _channel.invokeMethod<void>('cleanupPickedMedia', {
       'paths': files.map((file) => file.path).toList(growable: false),
     });
-  }
-
-  static String _mimeTypeForName(String name) {
-    final extension = name.split('.').last.toLowerCase();
-    return switch (extension) {
-      'jpg' || 'jpeg' => 'image/jpeg',
-      'png' => 'image/png',
-      'webp' => 'image/webp',
-      'gif' => 'image/gif',
-      'bmp' => 'image/bmp',
-      'heic' => 'image/heic',
-      'heif' => 'image/heif',
-      'avif' => 'image/avif',
-      'mp4' => 'video/mp4',
-      'mov' => 'video/quicktime',
-      'mkv' => 'video/x-matroska',
-      _ => 'application/octet-stream',
-    };
   }
 }

@@ -22,6 +22,7 @@ import 'core/quick_transfer.dart';
 import 'core/photo_transfer.dart';
 import 'platform/android_transfer_service.dart';
 import 'platform/android_save_file.dart';
+import 'platform/macos_security_scope.dart';
 import 'platform/windows_lifecycle_bridge.dart';
 
 enum RepositoryMode { local, sftp }
@@ -36,6 +37,11 @@ enum RepositoryConnectionStatus {
 enum FileSortField { name, type, size, modifiedAt }
 
 class AppController extends ChangeNotifier {
+  AppController({
+    Timer Function(Duration duration, void Function(Timer) callback)?
+    periodicTimerFactory,
+  }) : _periodicTimerFactory = periodicTimerFactory ?? Timer.periodic;
+
   static const _modeKey = 'repository_mode';
   static const _rootKey = 'local_root';
   static const _hostKey = 'sftp_host';
@@ -52,8 +58,12 @@ class AppController extends ChangeNotifier {
   static const _pendingTransfersKey = 'pending_transfers_v1';
   static const _quickRoot = '__jet2drop_transfer';
   static const _quickMessages = 'messages';
+  static const quickTransferActiveRefreshInterval = Duration(seconds: 15);
+  static const quickTransferInactiveRefreshInterval = Duration(seconds: 45);
 
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+  final Timer Function(Duration duration, void Function(Timer) callback)
+  _periodicTimerFactory;
   late SharedPreferences _preferences;
   RepositoryGateway? _gateway;
   Future<void>? _connectFuture;
@@ -110,6 +120,9 @@ class AppController extends ChangeNotifier {
   int? _quickInitializationGeneration;
   bool _quickInitializationActive = false;
   Timer? _quickMaintenanceTimer;
+  bool _quickMaintenanceInProgress = false;
+  bool _quickTransferPageActive = false;
+  DateTime? _lastQuickPresenceUpdate;
   DateTime? _lastQuickDeviceRefresh;
   final Map<String, QuickTransferManifest> _quickManifestCache = {};
   final Set<String> _hiddenQuickTransferIds = {};
@@ -119,6 +132,64 @@ class AppController extends ChangeNotifier {
   String deviceName = '';
   List<QuickDevice> quickDevices = const [];
   List<QuickTransferManifest> quickInbox = const [];
+
+  bool get isQuickTransferPageActive => _quickTransferPageActive;
+
+  Duration get quickRefreshInterval => _quickTransferPageActive
+      ? quickTransferActiveRefreshInterval
+      : quickTransferInactiveRefreshInterval;
+
+  /// Updates the page that is currently presenting quick-transfer data.
+  ///
+  /// The controller owns the one maintenance timer so the refresh cadence can
+  /// follow navigation without allowing the page and controller to poll at
+  /// the same time.
+  void setQuickTransferPageActive(bool active) {
+    if (_disposed || _quickTransferPageActive == active) return;
+    _quickTransferPageActive = active;
+    _restartQuickMaintenanceTimer();
+    if (active &&
+        isReady &&
+        deviceId.isNotEmpty &&
+        !_quickInitializationActive) {
+      unawaited(refreshQuickTransfer(refreshDevices: true));
+    }
+  }
+
+  void _restartQuickMaintenanceTimer({bool allowDuringInitialization = false}) {
+    _quickMaintenanceTimer?.cancel();
+    _quickMaintenanceTimer = null;
+    if (_disposed ||
+        !isReady ||
+        deviceId.isEmpty ||
+        (!allowDuringInitialization && _quickInitializationActive)) {
+      return;
+    }
+    final interval = quickRefreshInterval;
+    _quickMaintenanceTimer = _periodicTimerFactory(interval, (_) {
+      _onQuickMaintenanceTick();
+    });
+  }
+
+  void _stopQuickMaintenanceTimer() {
+    _quickMaintenanceTimer?.cancel();
+    _quickMaintenanceTimer = null;
+  }
+
+  void _onQuickMaintenanceTick() {
+    if (_quickMaintenanceInProgress) return;
+    final lastPresence = _lastQuickPresenceUpdate;
+    final presenceDue =
+        !_quickTransferPageActive ||
+        lastPresence == null ||
+        DateTime.now().difference(lastPresence) >=
+            quickTransferInactiveRefreshInterval;
+    if (presenceDue) {
+      unawaited(_maintainQuickPresence());
+    } else {
+      unawaited(refreshQuickTransfer(refreshDevices: true));
+    }
+  }
 
   static const int maxTransferFiles = 100;
   static const int maxTransferBytes = 10 * 1024 * 1024 * 1024;
@@ -143,9 +214,9 @@ class AppController extends ChangeNotifier {
         FileSortField.name => left.name.toLowerCase().compareTo(
           right.name.toLowerCase(),
         ),
-        FileSortField.type => _fileExtension(
+        FileSortField.type => fileExtension(
           left.name,
-        ).compareTo(_fileExtension(right.name)),
+        ).compareTo(fileExtension(right.name)),
         FileSortField.size => left.size.compareTo(right.size),
         FileSortField.modifiedAt => left.modifiedAt.compareTo(right.modifiedAt),
       };
@@ -232,6 +303,20 @@ class AppController extends ChangeNotifier {
 
   Future<void> _loadDefaultQuickSaveDirectory() async {
     final saved = _preferences.getString(_quickSaveDirectoryKey);
+    if (Platform.isMacOS) {
+      final restored = await MacosSecurityScope.restoreDirectoryAccess();
+      if (restored == null || restored.trim().isEmpty) {
+        defaultQuickSaveDirectory = null;
+        await _preferences.remove(_quickSaveDirectoryKey);
+        return;
+      }
+      final clean = restored.trim();
+      defaultQuickSaveDirectory = clean;
+      if (saved != clean) {
+        await _preferences.setString(_quickSaveDirectoryKey, clean);
+      }
+      return;
+    }
     if (saved != null && saved.trim().isNotEmpty) {
       // Do not silently replace a path that the user explicitly selected.
       defaultQuickSaveDirectory = saved.trim();
@@ -254,6 +339,11 @@ class AppController extends ChangeNotifier {
       throw StateError('默认保存位置必须是文件夹。');
     }
     await _verifyQuickSaveDirectoryWritable(directory);
+    if (Platform.isMacOS) {
+      // Persist only after validation so a failed selection never replaces
+      // the previously working bookmark.
+      await MacosSecurityScope.persistDirectoryAccess(clean);
+    }
     defaultQuickSaveDirectory = clean;
     await _preferences.setString(_quickSaveDirectoryKey, clean);
     notifyListeners();
@@ -783,10 +873,7 @@ class AppController extends ChangeNotifier {
       await _initializeQuickTransfer(generation);
       if (generation != _quickSessionGeneration || !isReady) return;
       quickError = null;
-      _quickMaintenanceTimer ??= Timer.periodic(
-        const Duration(seconds: 45),
-        (_) => unawaited(_maintainQuickPresence()),
-      );
+      _restartQuickMaintenanceTimer(allowDuringInitialization: true);
       notifyListeners();
     } catch (exception) {
       if (generation != _quickSessionGeneration || !isReady) return;
@@ -799,7 +886,14 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _maintainQuickPresence() async {
-    if (!isReady || hasRunningTransfers) return;
+    if (!isReady ||
+        deviceId.isEmpty ||
+        hasRunningTransfers ||
+        _quickInitializationActive ||
+        _quickMaintenanceInProgress) {
+      return;
+    }
+    _quickMaintenanceInProgress = true;
     final generation = _quickSessionGeneration;
     try {
       await _startPhotoTransferServer();
@@ -809,6 +903,8 @@ class AppController extends ChangeNotifier {
       if (generation != _quickSessionGeneration) return;
       quickError = describeError(exception);
       notifyListeners();
+    } finally {
+      _quickMaintenanceInProgress = false;
     }
   }
 
@@ -998,6 +1094,8 @@ class AppController extends ChangeNotifier {
 
   void _invalidateQuickState() {
     _quickSessionGeneration++;
+    _stopQuickMaintenanceTimer();
+    _lastQuickPresenceUpdate = null;
     _lastQuickDeviceRefresh = null;
     _quickDeviceCache.clear();
     _quickManifestCache.clear();
@@ -1100,6 +1198,7 @@ class AppController extends ChangeNotifier {
           overwrite: true,
         ),
       );
+      _lastQuickPresenceUpdate = DateTime.now();
     } finally {
       if (await source.exists()) await source.delete();
     }
@@ -1819,7 +1918,7 @@ class AppController extends ChangeNotifier {
     }
     await validateTransferSelection([source]);
     if (isPhoto) {
-      final selectedMime = mimeType?.split(';').first.trim().toLowerCase();
+      final selectedMime = normalizeMimeType(mimeType);
       if (!isSupportedPhotoTransfer(name: name, mimeType: selectedMime)) {
         throw StateError('照片必须同时具有受支持的图片扩展名和 MIME 类型。');
       }
@@ -1830,7 +1929,7 @@ class AppController extends ChangeNotifier {
         source,
         targetDevice: target,
         name: name,
-        mimeType: selectedMime!,
+        mimeType: selectedMime,
         recipient: recipient,
       );
     }
@@ -1960,6 +2059,9 @@ class AppController extends ChangeNotifier {
     } finally {
       _transferControls.remove(task.id);
       _syncForegroundTransfer(force: true);
+      if (task.status == TransferStatus.completed && isReady) {
+        unawaited(refreshQuickTransfer());
+      }
       notifyListeners();
     }
   }
@@ -2365,7 +2467,6 @@ class AppController extends ChangeNotifier {
     } finally {
       if (await source.exists()) await source.delete();
     }
-    await refreshQuickTransfer();
   }
 
   Future<void> deleteQuickTransfer(QuickTransferManifest manifest) {
@@ -2382,6 +2483,7 @@ class AppController extends ChangeNotifier {
       throw StateError('This device is not a participant in the transfer.');
     }
     _quickMutationInProgress = true;
+    var deleted = false;
     try {
       final refreshIdle = _quickRefreshIdle;
       if (_isRefreshingQuickTransfer && refreshIdle != null) {
@@ -2424,11 +2526,14 @@ class AppController extends ChangeNotifier {
         rethrow;
       }
       _hiddenQuickTransferIds.remove(manifest.id);
+      deleted = true;
       quickError = null;
       notifyListeners();
     } finally {
       _quickMutationInProgress = false;
-      if (_quickRefreshPending && !hasRunningTransfers) {
+      if (deleted && isReady && !hasRunningTransfers) {
+        await refreshQuickTransfer();
+      } else if (_quickRefreshPending && !hasRunningTransfers) {
         unawaited(refreshQuickTransfer());
       }
     }
@@ -2609,11 +2714,6 @@ class AppController extends ChangeNotifier {
     _gateway?.dispose();
     super.dispose();
   }
-}
-
-String _fileExtension(String name) {
-  final dot = name.lastIndexOf('.');
-  return dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
 }
 
 class _QueuedQuickTransfer {

@@ -123,7 +123,6 @@ class _RepositoryPageState extends State<RepositoryPage>
   bool _dragging = false;
   int _page = 0;
   bool _awaitingTailscale = false;
-  Timer? _quickRefreshTimer;
   final Set<String> _materializedUploadPaths = <String>{};
 
   AppController get controller => widget.controller;
@@ -132,17 +131,13 @@ class _RepositoryPageState extends State<RepositoryPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _quickRefreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (mounted && _page == 1 && controller.isReady) {
-        unawaited(controller.refreshQuickTransfer(refreshDevices: true));
-      }
-    });
+    controller.setQuickTransferPageActive(_page == 1);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _quickRefreshTimer?.cancel();
+    controller.setQuickTransferPageActive(false);
     super.dispose();
   }
 
@@ -249,9 +244,7 @@ class _RepositoryPageState extends State<RepositoryPage>
 
   void _selectPage(int value) {
     setState(() => _page = value);
-    if (value == 1 && controller.isReady) {
-      unawaited(controller.refreshQuickTransfer(refreshDevices: true));
-    }
+    controller.setQuickTransferPageActive(value == 1);
   }
 
   Widget _repositoryView() {
@@ -1016,7 +1009,7 @@ class _RepositoryPageState extends State<RepositoryPage>
           (item) => _QuickFileSelection(
             file: File(item.path),
             name: item.name,
-            mimeType: _mimeType(item.name),
+            mimeType: mimeTypeForName(item.name),
           ),
         ),
       );
@@ -1097,7 +1090,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   }) async {
     try {
       final name = metadata?.name ?? file.uri.pathSegments.last;
-      final mimeType = metadata?.mimeType ?? _mimeType(name);
+      final mimeType = metadata?.mimeType ?? mimeTypeForName(name);
       final isPhoto =
           allowPhotoDirect &&
           isSupportedPhotoTransfer(name: name, mimeType: mimeType);
@@ -1118,9 +1111,8 @@ class _RepositoryPageState extends State<RepositoryPage>
 
   Future<void> _claimQuickTransfer(QuickTransferManifest manifest) async {
     if (Platform.isAndroid) {
-      final mimeType = _mimeType(manifest.name);
-      final isMedia =
-          mimeType.startsWith('image/') || mimeType.startsWith('video/');
+      final mimeType = mimeTypeForName(manifest.name);
+      final isMedia = isMediaMimeType(mimeType);
       final documentTarget = isMedia
           ? null
           : await AndroidSaveFile.chooseDocumentTarget(
@@ -1424,7 +1416,7 @@ class _RepositoryPageState extends State<RepositoryPage>
     if (Platform.isAndroid) {
       final documentTarget = await AndroidSaveFile.chooseDocumentTarget(
         suggestedName: entry.name,
-        mimeType: _mimeType(entry.name),
+        mimeType: mimeTypeForName(entry.name),
       );
       if (documentTarget == null) return;
       final temp = await getApplicationSupportDirectory();
@@ -1788,14 +1780,7 @@ class _PreviewDialog extends StatelessWidget {
   }
 }
 
-bool _isImage(String name) => const {
-  'jpg',
-  'jpeg',
-  'png',
-  'webp',
-  'gif',
-  'bmp',
-}.contains(name.split('.').last.toLowerCase());
+bool _isImage(String name) => isPreviewImageFileName(name);
 
 class _QuickFileSelection {
   const _QuickFileSelection({
@@ -1830,23 +1815,12 @@ bool _isPreviewable(String name) =>
       'html',
       'css',
       'xml',
-    }.contains(name.split('.').last.toLowerCase());
+    }.contains(fileExtension(name));
 IconData _fileIcon(String name) => _isImage(name)
     ? Icons.image_outlined
-    : const {
-        'mp3',
-        'm4a',
-        'wav',
-        'flac',
-      }.contains(name.split('.').last.toLowerCase())
+    : isAudioFileName(name)
     ? Icons.audio_file_outlined
-    : const {
-        'mp4',
-        'mov',
-        'mkv',
-        'webm',
-        'avi',
-      }.contains(name.split('.').last.toLowerCase())
+    : isVideoFileName(name)
     ? Icons.video_file_outlined
     : Icons.description_outlined;
 String _formatBytes(int value) {
@@ -1871,22 +1845,3 @@ String _statusLabel(TransferStatus status) => switch (status) {
   TransferStatus.failed => '失败',
   TransferStatus.cancelled => '已取消',
 };
-String _mimeType(String name) {
-  final extension = name.split('.').last.toLowerCase();
-  return switch (extension) {
-    'jpg' || 'jpeg' => 'image/jpeg',
-    'png' => 'image/png',
-    'webp' => 'image/webp',
-    'gif' => 'image/gif',
-    'bmp' => 'image/bmp',
-    'heic' => 'image/heic',
-    'heif' => 'image/heif',
-    'avif' => 'image/avif',
-    'mp3' => 'audio/mpeg',
-    'm4a' => 'audio/mp4',
-    'wav' => 'audio/wav',
-    'mp4' => 'video/mp4',
-    'mov' => 'video/quicktime',
-    _ => 'application/octet-stream',
-  };
-}

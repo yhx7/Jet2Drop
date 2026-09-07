@@ -1,19 +1,7 @@
-import 'dart:convert';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
-
+import 'checksum.dart';
 import 'path_utils.dart';
-
-class _DigestSink implements Sink<Digest> {
-  Digest? value;
-
-  @override
-  void add(Digest event) => value = event;
-
-  @override
-  void close() {}
-}
 
 /// Durable wire format used by both direct and relay quick-transfer paths.
 /// Payloads are written to a .part file and the manifest is published last.
@@ -125,154 +113,12 @@ class QuickTransferService {
     );
   }
 
-  Future<QuickTransferManifest> inspect(
-    File source, {
-    Duration ttl = const Duration(hours: 24),
-    String senderDevice = '',
-    String targetDevice = '',
-    String? transferId,
-    void Function(int, int)? onProgress,
-  }) async {
-    final total = await source.length();
-    var read = 0;
-    final digest = _DigestSink();
-    final hashing = sha256.startChunkedConversion(digest);
-    await for (final chunk in source.openRead()) {
-      hashing.add(chunk);
-      read += chunk.length;
-      onProgress?.call(read, total);
-    }
-    hashing.close();
-    return describe(
-      source,
-      size: total,
-      checksum: digest.value!.toString(),
-      ttl: ttl,
-      senderDevice: senderDevice,
-      targetDevice: targetDevice,
-      transferId: transferId,
-    );
-  }
-
   Future<String> checksum(File source) async {
-    final digest = _DigestSink();
-    final hashing = sha256.startChunkedConversion(digest);
+    final checksum = Sha256Accumulator();
     await for (final chunk in source.openRead()) {
-      hashing.add(chunk);
+      checksum.add(chunk);
     }
-    hashing.close();
-    return digest.value!.toString();
-  }
-
-  Future<QuickTransferManifest> publish(
-    File source,
-    Directory packageDir, {
-    Duration ttl = const Duration(hours: 24),
-    String senderDevice = '',
-    String targetDevice = '',
-    String? transferId,
-    void Function(int, int)? onProgress,
-  }) async {
-    await packageDir.create(recursive: true);
-    final id =
-        transferId ??
-        '${DateTime.now().microsecondsSinceEpoch}-${_safeName(source)}';
-    final payload = File('${packageDir.path}${Platform.pathSeparator}$id.part');
-    final total = await source.length();
-    var copied = 0;
-    final digest = _DigestSink();
-    final hashing = sha256.startChunkedConversion(digest);
-    final output = payload.openWrite();
-    try {
-      await for (final chunk in source.openRead()) {
-        hashing.add(chunk);
-        output.add(chunk);
-        copied += chunk.length;
-        onProgress?.call(copied, total);
-      }
-      await output.flush();
-    } finally {
-      await output.close();
-      hashing.close();
-    }
-    final checksum = digest.value!.toString();
-    final now = DateTime.now().toUtc();
-    final manifest = QuickTransferManifest(
-      id: id,
-      name: sanitizeTransferFileName(source.uri.pathSegments.last),
-      size: total,
-      sha256: checksum,
-      createdAt: now,
-      expiresAt: now.add(ttl),
-      chunkSize: total > 32 * 1024 * 1024 ? chunkSize : total,
-      senderDevice: senderDevice,
-      targetDevice: targetDevice,
-    );
-    final finalPayload = File(
-      '${packageDir.path}${Platform.pathSeparator}$id.bin',
-    );
-    await payload.rename(finalPayload.path);
-    await File(
-      '${packageDir.path}${Platform.pathSeparator}$id.json',
-    ).writeAsString(jsonEncode(manifest.toJson()), flush: true);
-    return manifest;
-  }
-
-  Future<File> receive(
-    QuickTransferManifest manifest,
-    Directory packageDir,
-    File target, {
-    void Function(int, int)? onProgress,
-  }) async {
-    if (manifest.expiresAt.isBefore(DateTime.now().toUtc())) {
-      throw StateError('Transfer has expired');
-    }
-    final source = File(
-      '${packageDir.path}${Platform.pathSeparator}${manifest.id}.bin',
-    );
-    if (!await source.exists()) throw StateError('Transfer payload is missing');
-    final temp = File('${target.path}.jet2drop-${manifest.id}.part');
-    await temp.parent.create(recursive: true);
-    var copied = 0;
-    final digest = _DigestSink();
-    final hashing = sha256.startChunkedConversion(digest);
-    final output = temp.openWrite();
-    try {
-      await for (final chunk in source.openRead()) {
-        hashing.add(chunk);
-        output.add(chunk);
-        copied += chunk.length;
-        onProgress?.call(copied, manifest.size);
-      }
-      await output.flush();
-    } finally {
-      await output.close();
-      hashing.close();
-    }
-    if (copied != manifest.size ||
-        digest.value!.toString() != manifest.sha256) {
-      try {
-        await temp.delete();
-      } catch (_) {}
-      throw StateError('Transfer checksum verification failed');
-    }
-    final backup = File(
-      '${target.path}.jet2drop-backup-${DateTime.now().microsecondsSinceEpoch}',
-    );
-    final hadTarget = await target.exists();
-    if (hadTarget) await target.rename(backup.path);
-    try {
-      await temp.rename(target.path);
-    } catch (_) {
-      if (hadTarget && await backup.exists()) await backup.rename(target.path);
-      rethrow;
-    }
-    if (hadTarget && await backup.exists()) {
-      try {
-        await backup.delete();
-      } catch (_) {}
-    }
-    return target;
+    return checksum.close();
   }
 
   /// Verifies a downloaded payload in place and atomically publishes it.
@@ -292,15 +138,13 @@ class QuickTransferService {
     var checksum = verifiedChecksum;
     if (read == null || checksum == null) {
       read = 0;
-      final digest = _DigestSink();
-      final hashing = sha256.startChunkedConversion(digest);
+      final accumulator = Sha256Accumulator();
       await for (final chunk in payload.openRead()) {
-        hashing.add(chunk);
+        accumulator.add(chunk);
         read = read! + chunk.length;
         onProgress?.call(read, manifest.size);
       }
-      hashing.close();
-      checksum = digest.value?.toString();
+      checksum = accumulator.close();
     }
     if (read != manifest.size || checksum != manifest.sha256) {
       throw StateError('Transfer checksum verification failed');
@@ -321,43 +165,6 @@ class QuickTransferService {
       } catch (_) {}
     }
     return target;
-  }
-
-  Future<List<QuickTransferManifest>> list(Directory packageDir) async {
-    if (!await packageDir.exists()) return const [];
-    final result = <QuickTransferManifest>[];
-    await for (final entity in packageDir.list()) {
-      if (entity is! File || !entity.path.endsWith('.json')) continue;
-      try {
-        final manifest = QuickTransferManifest.fromJson(
-          jsonDecode(await entity.readAsString()) as Map<String, dynamic>,
-        );
-        if (manifest.expiresAt.isAfter(DateTime.now().toUtc())) {
-          result.add(manifest);
-        }
-      } catch (_) {
-        // Ignore incomplete or invalid manifests; cleanup handles them later.
-      }
-    }
-    return result;
-  }
-
-  Future<void> cleanup(Directory packageDir) async {
-    if (!await packageDir.exists()) return;
-    final valid = {for (final item in await list(packageDir)) item.id};
-    await for (final entity in packageDir.list()) {
-      if (entity is! File) continue;
-      final name = entity.uri.pathSegments.last;
-      final id = name.replaceFirst(RegExp(r'\.(json|bin|part)$'), '');
-      if ((name.endsWith('.json') ||
-              name.endsWith('.bin') ||
-              name.endsWith('.part')) &&
-          !valid.contains(id)) {
-        try {
-          await entity.delete();
-        } catch (_) {}
-      }
-    }
   }
 
   String _safeName(File file) =>

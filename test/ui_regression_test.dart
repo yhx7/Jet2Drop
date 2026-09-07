@@ -142,6 +142,11 @@ void main() {
 
     expect(find.text('目标设备'), findsWidgets);
     expect(find.text('目标设备（在线）'), findsNothing);
+
+    // The controller owns the background cadence, so stop it before the
+    // widget-test binding checks for leaked timers.
+    controller.dispose();
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 
   testWidgets(

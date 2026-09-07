@@ -1,5 +1,70 @@
 import 'dart:math';
 
+const _mimeTypesByExtension = <String, String>{
+  'jpg': 'image/jpeg',
+  'jpeg': 'image/jpeg',
+  'png': 'image/png',
+  'webp': 'image/webp',
+  'gif': 'image/gif',
+  'bmp': 'image/bmp',
+  'heic': 'image/heic',
+  'heif': 'image/heif',
+  'avif': 'image/avif',
+  'mp4': 'video/mp4',
+  'mov': 'video/quicktime',
+  'mkv': 'video/x-matroska',
+  'webm': 'video/webm',
+  'avi': 'video/x-msvideo',
+  'mp3': 'audio/mpeg',
+  'm4a': 'audio/mp4',
+  'wav': 'audio/wav',
+  'flac': 'audio/flac',
+};
+
+// These are the image formats Flutter can preview consistently on all of the
+// supported desktop and mobile runtimes.  HEIC/AVIF remain valid transfer
+// formats, but are left to the system viewer when preview support is absent.
+const _previewImageExtensions = <String>{
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'bmp',
+};
+
+String fileExtension(String name) {
+  final dot = name.lastIndexOf('.');
+  return dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
+}
+
+String mimeTypeForName(String name) =>
+    _mimeTypesByExtension[fileExtension(name)] ?? 'application/octet-stream';
+
+bool isPhotoFileName(String name) => isImageMimeType(mimeTypeForName(name));
+
+bool isPreviewImageFileName(String name) =>
+    _previewImageExtensions.contains(fileExtension(name));
+
+bool isAudioFileName(String name) => isAudioMimeType(mimeTypeForName(name));
+
+bool isVideoFileName(String name) => isVideoMimeType(mimeTypeForName(name));
+
+String normalizeMimeType(String? value) =>
+    value?.split(';').first.trim().toLowerCase() ?? '';
+
+bool isImageMimeType(String? value) =>
+    normalizeMimeType(value).startsWith('image/');
+
+bool isVideoMimeType(String? value) =>
+    normalizeMimeType(value).startsWith('video/');
+
+bool isAudioMimeType(String? value) =>
+    normalizeMimeType(value).startsWith('audio/');
+
+bool isMediaMimeType(String? value) =>
+    isImageMimeType(value) || isVideoMimeType(value);
+
 String normalizeRelativePath(String value) {
   final parts = value.replaceAll('\\', '/').split('/');
   final clean = <String>[];

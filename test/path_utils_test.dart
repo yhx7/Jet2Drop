@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -21,19 +20,35 @@ void main() {
     expect(() => normalizeRelativePath('../private'), throwsArgumentError);
   });
 
-  test('publishes and receives a checksummed payload', () async {
+  test('shares file type and MIME classification across platforms', () {
+    expect(fileExtension('PHOTO.JpG'), 'jpg');
+    expect(mimeTypeForName('movie.MKV'), 'video/x-matroska');
+    expect(mimeTypeForName('recording.FLAC'), 'audio/flac');
+    expect(isPhotoFileName('photo.heic'), isTrue);
+    expect(isPreviewImageFileName('photo.heic'), isFalse);
+    expect(isAudioFileName('recording.flac'), isTrue);
+    expect(isVideoFileName('movie.webm'), isTrue);
+    expect(isMediaMimeType('image/jpeg; charset=binary'), isTrue);
+    expect(isMediaMimeType('text/plain'), isFalse);
+  });
+
+  test('describes and verifies a checksummed payload', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-test-');
     addTearDown(() => root.delete(recursive: true));
     final source = File('${root.path}${Platform.pathSeparator}photo.jpg');
-    await source.writeAsBytes(
-      List<int>.generate(100000, (index) => index % 251),
-    );
+    final bytes = List<int>.generate(100000, (index) => index % 251);
+    await source.writeAsBytes(bytes);
+    final payload = File('${root.path}${Platform.pathSeparator}photo.part');
+    await source.copy(payload.path);
     final service = QuickTransferService(chunkSize: 1024);
-    final manifest = await service.publish(
-      source,
-      Directory('${root.path}/inbox'),
+    final manifest = service.describe(
+      payload,
+      size: bytes.length,
+      checksum: await service.checksum(payload),
       senderDevice: 'windows',
       targetDevice: 'android',
+      name: source.uri.pathSegments.last,
+      transferId: 'test-transfer',
     );
     expect(manifest.size, 100000);
     expect(manifest.sha256, isNotEmpty);
@@ -47,8 +62,9 @@ void main() {
     expect(claimed.claimedBy, 'android');
     expect(QuickTransferManifest.fromJson(claimed.toJson()).isClaimed, isTrue);
     final target = File('${root.path}/received.jpg');
-    await service.receive(manifest, Directory('${root.path}/inbox'), target);
-    expect(await target.readAsBytes(), await source.readAsBytes());
+    await service.verifyAndPublish(manifest, payload, target);
+    expect(await target.readAsBytes(), bytes);
+    expect(await payload.exists(), isFalse);
   });
 
   test('local repository uploads atomically and downloads bytes', () async {
@@ -393,41 +409,6 @@ void main() {
       isFalse,
     );
   });
-
-  test(
-    'quick transfer cleanup removes expired payloads and manifests',
-    () async {
-      final root = await Directory.systemTemp.createTemp('jet2drop-cleanup-');
-      addTearDown(() => root.delete(recursive: true));
-      final package = Directory('${root.path}${Platform.pathSeparator}inbox');
-      await package.create();
-      const id = 'expired-message';
-      final expired = QuickTransferManifest(
-        id: id,
-        name: 'expired.txt',
-        size: 3,
-        sha256: 'unused',
-        createdAt: DateTime.utc(2020),
-        expiresAt: DateTime.utc(2020, 1, 2),
-        chunkSize: 3,
-      );
-      await File(
-        '${package.path}${Platform.pathSeparator}$id.json',
-      ).writeAsString(jsonEncode(expired.toJson()));
-      await File(
-        '${package.path}${Platform.pathSeparator}$id.bin',
-      ).writeAsBytes([1, 2, 3]);
-      await QuickTransferService().cleanup(package);
-      expect(
-        await File('${package.path}${Platform.pathSeparator}$id.json').exists(),
-        isFalse,
-      );
-      expect(
-        await File('${package.path}${Platform.pathSeparator}$id.bin').exists(),
-        isFalse,
-      );
-    },
-  );
 
   group('sanitizeTransferFileName', () {
     test('replaces characters rejected by Windows and path separators', () {

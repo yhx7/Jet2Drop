@@ -9,7 +9,54 @@ class MainFlutterWindow: NSWindow {
     self.setFrame(windowFrame, display: true)
 
     RegisterGeneratedPlugins(registry: flutterViewController)
+    registerSecurityScopedBookmarkChannel(
+      with: flutterViewController.engine.binaryMessenger
+    )
 
     super.awakeFromNib()
+  }
+
+  private func registerSecurityScopedBookmarkChannel(
+    with messenger: FlutterBinaryMessenger
+  ) {
+    let channel = FlutterMethodChannel(
+      name: "jet2drop/macos_security_scope",
+      binaryMessenger: messenger
+    )
+    channel.setMethodCallHandler { call, result in
+      switch call.method {
+      case "restoreDirectoryAccess":
+        result(SecurityScopedBookmarkStore.shared.restoreDirectoryAccess())
+      case "persistDirectoryAccess":
+        guard let arguments = call.arguments as? [String: Any],
+              let path = arguments["path"] as? String,
+              !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+          result(
+            FlutterError(
+              code: "invalid_arguments",
+              message: "目录路径不能为空。",
+              details: nil
+            )
+          )
+          return
+        }
+        do {
+          try SecurityScopedBookmarkStore.shared.persistDirectoryAccess(
+            path: path
+          )
+          result(nil)
+        } catch {
+          result(
+            FlutterError(
+              code: "security_scope_error",
+              message: error.localizedDescription,
+              details: nil
+            )
+          )
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
   }
 }

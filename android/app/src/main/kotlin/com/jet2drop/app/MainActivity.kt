@@ -26,8 +26,6 @@ class MainActivity : FlutterActivity() {
     private val transferServiceChannelName = "jet2drop/transfer_service"
     private val createDocumentRequestCode = 41002
     private val pickMediaRequestCode = 41003
-    private var pendingSourcePath: String? = null
-    private var pendingResult: MethodChannel.Result? = null
     private var pendingTargetResult: MethodChannel.Result? = null
     private var pendingMediaResult: MethodChannel.Result? = null
 
@@ -71,22 +69,6 @@ class MainActivity : FlutterActivity() {
             }
             targetCallback.success(uri?.toString())
             return
-        }
-        val sourcePath = pendingSourcePath
-        val callback = pendingResult
-        pendingSourcePath = null
-        pendingResult = null
-        if (resultCode != Activity.RESULT_OK || data?.data == null || sourcePath == null) {
-            callback?.success(false)
-            return
-        }
-        try {
-            contentResolver.openOutputStream(data.data!!, "w")!!.use { output ->
-                File(sourcePath).inputStream().use { input -> input.copyTo(output) }
-            }
-            callback?.success(true)
-        } catch (error: Exception) {
-            callback?.error("save_failed", error.message, null)
         }
     }
 
@@ -160,7 +142,7 @@ class MainActivity : FlutterActivity() {
                     return@setMethodCallHandler
                 }
                 if (call.method == "chooseDocumentTarget") {
-                    if (pendingTargetResult != null || pendingResult != null) {
+                    if (pendingTargetResult != null) {
                         result.error("busy", "Another save request is active.", null)
                         return@setMethodCallHandler
                     }
@@ -192,28 +174,7 @@ class MainActivity : FlutterActivity() {
                     }
                     return@setMethodCallHandler
                 }
-                if (call.method != "saveDocument") {
-                    result.notImplemented()
-                    return@setMethodCallHandler
-                }
-                if (pendingResult != null) {
-                    result.error("busy", "Another save request is active.", null)
-                    return@setMethodCallHandler
-                }
-                val sourcePath = call.argument<String>("sourcePath")
-                val suggestedName = call.argument<String>("suggestedName") ?: "download"
-                val mimeType = call.argument<String>("mimeType") ?: "application/octet-stream"
-                if (sourcePath == null || !File(sourcePath).exists()) {
-                    result.error("source_missing", "Downloaded file is no longer available.", null)
-                    return@setMethodCallHandler
-                }
-                pendingSourcePath = sourcePath
-                pendingResult = result
-                startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = mimeType
-                    putExtra(Intent.EXTRA_TITLE, suggestedName)
-                }, createDocumentRequestCode)
+                result.notImplemented()
             }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, mediaPickerChannelName)
             .setMethodCallHandler { call, result ->

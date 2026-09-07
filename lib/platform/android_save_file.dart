@@ -5,19 +5,6 @@ import 'package:flutter/services.dart';
 class AndroidSaveFile {
   static const _channel = MethodChannel('jet2drop/save_document');
 
-  static Future<bool> save({
-    required File source,
-    required String suggestedName,
-    required String mimeType,
-  }) async {
-    final result = await _channel.invokeMethod<bool>('saveDocument', {
-      'sourcePath': source.path,
-      'suggestedName': suggestedName,
-      'mimeType': mimeType,
-    });
-    return result ?? false;
-  }
-
   static Future<String?> chooseDocumentTarget({
     required String suggestedName,
     required String mimeType,
