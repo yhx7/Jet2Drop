@@ -12,8 +12,54 @@ class MainFlutterWindow: NSWindow {
     registerSecurityScopedBookmarkChannel(
       with: flutterViewController.engine.binaryMessenger
     )
+    registerLifecycleChannel(
+      with: flutterViewController.engine.binaryMessenger
+    )
 
     super.awakeFromNib()
+  }
+
+  private func registerLifecycleChannel(
+    with messenger: FlutterBinaryMessenger
+  ) {
+    let channel = FlutterMethodChannel(
+      name: "jet2drop/macos_lifecycle",
+      binaryMessenger: messenger
+    )
+    channel.setMethodCallHandler { call, result in
+      guard let delegate = NSApp.delegate as? AppDelegate else {
+        result(
+          FlutterError(
+            code: "lifecycle_unavailable",
+            message: "应用生命周期服务尚未就绪。",
+            details: nil
+          )
+        )
+        return
+      }
+      switch call.method {
+      case "setActiveTransfers":
+        guard let active = call.arguments as? Bool else {
+          result(
+            FlutterError(
+              code: "invalid_arguments",
+              message: "传输状态必须是布尔值。",
+              details: nil
+            )
+          )
+          return
+        }
+        delegate.setActiveTransfers(active)
+        result(nil)
+      case "requestExit":
+        result(nil)
+        DispatchQueue.main.async {
+          delegate.requestExit()
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
   }
 
   private func registerSecurityScopedBookmarkChannel(

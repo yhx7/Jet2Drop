@@ -24,6 +24,23 @@ void main() {
     expect(find.widgetWithText(FilledButton, '连接设置'), findsOneWidget);
   });
 
+  testWidgets('desktop settings expose an explicit exit action', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = false
+      ..isReady = true;
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(home: RepositoryPage(controller: controller)),
+    );
+    await tester.tap(find.byIcon(Icons.settings_outlined));
+    await tester.pumpAndSettle();
+
+    expect(find.text('彻底退出'), findsOneWidget);
+  });
+
   testWidgets('connecting state never flashes the repository page', (
     tester,
   ) async {

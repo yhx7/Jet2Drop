@@ -115,8 +115,43 @@ final class SecurityScopedBookmarkStore {
 
 @main
 class AppDelegate: FlutterAppDelegate {
+  private var statusItem: NSStatusItem?
+  private var hasActiveTransfers = false
+
+  override func applicationDidFinishLaunching(_ notification: Notification) {
+    super.applicationDidFinishLaunching(notification)
+    installStatusItem()
+  }
+
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+    return false
+  }
+
+  override func applicationShouldHandleReopen(
+    _ sender: NSApplication,
+    hasVisibleWindows flag: Bool
+  ) -> Bool {
+    showMainWindow()
     return true
+  }
+
+  override func applicationShouldTerminate(
+    _ sender: NSApplication
+  ) -> NSApplication.TerminateReply {
+    guard hasActiveTransfers else {
+      return super.applicationShouldTerminate(sender)
+    }
+    let alert = NSAlert()
+    alert.messageText = "仍有文件正在传输"
+    alert.informativeText = "彻底退出会中断当前任务，确定退出吗？"
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "取消")
+    alert.addButton(withTitle: "彻底退出")
+    guard alert.runModal() == .alertSecondButtonReturn else {
+      return .terminateCancel
+    }
+    hasActiveTransfers = false
+    return super.applicationShouldTerminate(sender)
   }
 
   override func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -124,7 +159,59 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   override func applicationWillTerminate(_ notification: Notification) {
+    statusItem = nil
     SecurityScopedBookmarkStore.shared.releaseDirectoryAccess()
     super.applicationWillTerminate(notification)
+  }
+
+  func setActiveTransfers(_ active: Bool) {
+    hasActiveTransfers = active
+  }
+
+  func requestExit() {
+    NSApp.terminate(nil)
+  }
+
+  @objc private func showMainWindow() {
+    guard let window = NSApp.windows.first(where: { $0.canBecomeMain }) else {
+      return
+    }
+    window.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  @objc private func exitApplication() {
+    requestExit()
+  }
+
+  private func installStatusItem() {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    if let button = item.button {
+      let image = NSImage(
+        systemSymbolName: "arrow.left.arrow.right",
+        accessibilityDescription: "Jet2Drop"
+      )
+      image?.isTemplate = true
+      button.image = image
+      button.toolTip = "Jet2Drop"
+    }
+    let menu = NSMenu()
+    let openItem = NSMenuItem(
+      title: "打开 Jet2Drop",
+      action: #selector(showMainWindow),
+      keyEquivalent: ""
+    )
+    openItem.target = self
+    menu.addItem(openItem)
+    menu.addItem(.separator())
+    let exitItem = NSMenuItem(
+      title: "彻底退出",
+      action: #selector(exitApplication),
+      keyEquivalent: "q"
+    )
+    exitItem.target = self
+    menu.addItem(exitItem)
+    item.menu = menu
+    statusItem = item
   }
 }

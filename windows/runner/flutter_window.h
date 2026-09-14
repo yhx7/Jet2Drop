@@ -24,6 +24,12 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  void AddTrayIcon();
+  void RemoveTrayIcon();
+  void ShowMainWindow();
+  void ShowTrayMenu();
+  void RequestExit();
+
   // The project to run.
   flutter::DartProject project_;
 
@@ -32,6 +38,9 @@ class FlutterWindow : public Win32Window {
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       lifecycle_channel_;
   bool has_active_transfers_ = false;
+  bool exit_requested_ = false;
+  bool tray_icon_added_ = false;
+  UINT taskbar_created_message_ = 0;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

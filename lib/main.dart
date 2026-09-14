@@ -17,6 +17,7 @@ import 'core/transfer_control.dart';
 import 'infrastructure/sftp_repository_gateway.dart';
 import 'platform/android_media_picker.dart';
 import 'platform/android_save_file.dart';
+import 'platform/desktop_lifecycle_bridge.dart';
 import 'platform/tailscale_bridge.dart';
 
 Future<void> main() async {
@@ -1673,6 +1674,15 @@ class _RepositoryPageState extends State<RepositoryPage>
             ),
           ),
           actions: [
+            if (Platform.isWindows || Platform.isMacOS)
+              TextButton.icon(
+                onPressed: () {
+                  Navigator.pop(context);
+                  unawaited(DesktopLifecycleBridge.requestExit());
+                },
+                icon: const Icon(Icons.power_settings_new),
+                label: const Text('彻底退出'),
+              ),
             TextButton(
               onPressed: () => Navigator.pop(context),
               child: const Text('取消'),

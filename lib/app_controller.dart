@@ -23,7 +23,7 @@ import 'core/photo_transfer.dart';
 import 'platform/android_transfer_service.dart';
 import 'platform/android_save_file.dart';
 import 'platform/macos_security_scope.dart';
-import 'platform/windows_lifecycle_bridge.dart';
+import 'platform/desktop_lifecycle_bridge.dart';
 
 enum RepositoryMode { local, sftp }
 
@@ -2832,8 +2832,8 @@ class AppController extends ChangeNotifier {
       if (_repositoryRefreshPending) unawaited(refresh());
       if (_quickRefreshPending) unawaited(refreshQuickTransfer());
     }
-    if (Platform.isWindows) {
-      unawaited(WindowsLifecycleBridge.setActiveTransfers(hasActiveTransfers));
+    if (Platform.isWindows || Platform.isMacOS) {
+      unawaited(DesktopLifecycleBridge.setActiveTransfers(hasActiveTransfers));
     }
     if (!Platform.isAndroid) return;
     final now = DateTime.now();

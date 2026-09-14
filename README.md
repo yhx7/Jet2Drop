@@ -15,3 +15,7 @@ Jet2Drop 是 Android 与 Windows 之间使用 Tailscale 和 SFTPGo 的私人文�
 ## Windows 一键部署
 
 在项目目录运行 `powershell -ExecutionPolicy Bypass -File .\tools\deploy_windows.ps1`。脚本会构建正式版、只关闭部署目录中的旧进程、完整复制并校验文件，然后重新启动应用。仅部署已有构建可追加 `-SkipBuild`。
+
+## 桌面端后台运行
+
+Windows 和 macOS 关闭主窗口后仍保持 Jet2Drop 在后台运行，继续维护设备在线状态、照片接收服务和传输任务。Windows 从系统托盘、macOS 从菜单栏可以重新打开窗口或选择“彻底退出”；应用连接设置中也提供“彻底退出”。彻底退出时若仍有传输任务，应用会先要求确认。
