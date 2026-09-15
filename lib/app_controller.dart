@@ -18,8 +18,11 @@ import 'core/transfer_control.dart';
 import 'infrastructure/local_repository_gateway.dart';
 import 'infrastructure/serialized_repository_gateway.dart';
 import 'infrastructure/sftp_repository_gateway.dart';
+import 'infrastructure/direct_transfer_secret_store.dart';
 import 'core/quick_transfer.dart';
 import 'core/photo_transfer.dart';
+import 'infrastructure/quick_device_store.dart';
+import 'infrastructure/secret_vault.dart';
 import 'platform/android_transfer_service.dart';
 import 'platform/android_save_file.dart';
 import 'platform/macos_security_scope.dart';
@@ -36,11 +39,36 @@ enum RepositoryConnectionStatus {
 
 enum FileSortField { name, type, size, modifiedAt }
 
+typedef DirectTransferServerFactory =
+    DirectTransferServer Function({
+      required String token,
+      required Future<String?> Function() saveDirectoryProvider,
+      required int port,
+    });
+
 class AppController extends ChangeNotifier {
   AppController({
     Timer Function(Duration duration, void Function(Timer) callback)?
     periodicTimerFactory,
-  }) : _periodicTimerFactory = periodicTimerFactory ?? Timer.periodic;
+    QuickDeviceStore? quickDeviceStore,
+    DirectTransferClient? directTransferClient,
+    DirectTransferServerFactory? directTransferServerFactory,
+    FlutterSecureStorage? secureStorage,
+    DirectTransferSecretStore? directTransferSecretStore,
+  }) {
+    _periodicTimerFactory = periodicTimerFactory ?? Timer.periodic;
+    _directTransferClient = directTransferClient ?? DirectTransferClient();
+    final vault = Jet2DropSecretVault(
+      backend: FlutterSecureSecretVaultBackend(storage: secureStorage),
+    );
+    _secretVault = vault;
+    _quickDeviceStore =
+        quickDeviceStore ??
+        QuickDeviceStore(secretStore: VaultQuickDeviceSecretStore(vault));
+    _directTransferSecretStore =
+        directTransferSecretStore ?? VaultDirectTransferSecretStore(vault);
+    _directTransferServerFactory = directTransferServerFactory;
+  }
 
   static const _modeKey = 'repository_mode';
   static const _rootKey = 'local_root';
@@ -53,6 +81,7 @@ class AppController extends ChangeNotifier {
   static const _sortAscendingKey = 'file_sort_ascending';
   static const _deviceIdKey = 'quick_device_id';
   static const _deviceNameKey = 'quick_device_name';
+  static const _quickTransferModeKey = 'quick_transfer_mode';
   static const _photoTokenKey = 'photo_transfer_token';
   static const _quickSaveDirectoryKey = 'quick_save_directory';
   static const _pendingTransfersKey = 'pending_transfers_v1';
@@ -61,15 +90,19 @@ class AppController extends ChangeNotifier {
   static const quickTransferActiveRefreshInterval = Duration(seconds: 15);
   static const quickTransferInactiveRefreshInterval = Duration(seconds: 45);
 
-  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage(
-    // Ad-hoc local macOS builds cannot carry the Keychain Sharing entitlement
-    // required by the data-protection Keychain. The legacy Keychain remains
-    // encrypted by macOS and persists credentials without developer signing.
-    mOptions: MacOsOptions(usesDataProtectionKeychain: false),
-  );
-  final Timer Function(Duration duration, void Function(Timer) callback)
+  /// Fixed high port used by the desktop direct receiver so registrations do
+  /// not change every time the app restarts.
+  static const directTransferPort = 37123;
+
+  late final Jet2DropSecretVault _secretVault;
+  late final DirectTransferSecretStore _directTransferSecretStore;
+  late final Timer Function(Duration duration, void Function(Timer) callback)
   _periodicTimerFactory;
+  late final QuickDeviceStore _quickDeviceStore;
+  late final DirectTransferClient _directTransferClient;
+  late final DirectTransferServerFactory? _directTransferServerFactory;
   late SharedPreferences _preferences;
+  bool _preferencesReady = false;
   RepositoryGateway? _gateway;
   Future<void>? _connectFuture;
 
@@ -93,6 +126,7 @@ class AppController extends ChangeNotifier {
   final Map<String, Future<void> Function(TransferTask)> _retryActions = {};
   final Map<String, Future<void> Function()> _cleanupActions = {};
   final Map<String, Future<void> Function()> _completionCleanupActions = {};
+  final Map<String, DirectTransferReceipt> _directReceipts = {};
   final Map<String, Map<String, Object?>> _pendingTransferRecords = {};
   Future<void> _pendingWriteTail = Future<void>.value();
   final Map<String, Completer<void>> _taskSettled = {};
@@ -107,9 +141,12 @@ class AppController extends ChangeNotifier {
   DateTime? _lastTransferUiUpdate;
   Timer? _transferUiTimer;
   final QuickTransferService quickTransfer = QuickTransferService();
+  QuickTransferMode quickTransferMode = QuickTransferMode.direct;
   final PhotoTransferClient _photoTransferClient = PhotoTransferClient();
-  PhotoTransferServer? _photoTransferServer;
+  DirectTransferServer? _directTransferServer;
   String? defaultQuickSaveDirectory;
+  String? directTransferError;
+  // Kept as a source-compatible alias for older settings/tests.
   String? photoTransferError;
   int _quickRefreshGeneration = 0;
   int _quickSessionGeneration = 0;
@@ -125,6 +162,7 @@ class AppController extends ChangeNotifier {
   int? _quickInitializationGeneration;
   bool _quickInitializationActive = false;
   Timer? _quickMaintenanceTimer;
+  Future<void>? _directServerStartFuture;
   bool _quickMaintenanceInProgress = false;
   bool _quickTransferPageActive = false;
   DateTime? _lastQuickPresenceUpdate;
@@ -166,7 +204,6 @@ class AppController extends ChangeNotifier {
     _quickMaintenanceTimer?.cancel();
     _quickMaintenanceTimer = null;
     if (_disposed ||
-        !isReady ||
         deviceId.isEmpty ||
         (!allowDuringInitialization && _quickInitializationActive)) {
       return;
@@ -184,6 +221,10 @@ class AppController extends ChangeNotifier {
 
   void _onQuickMaintenanceTick() {
     if (_quickMaintenanceInProgress) return;
+    // Direct receiver maintenance is independent from relay presence. A
+    // Tailscale address can appear while SFTPGo remains unavailable.
+    unawaited(_startDirectTransferServer());
+    if (!isReady) return;
     final lastPresence = _lastQuickPresenceUpdate;
     final presenceDue =
         !_quickTransferPageActive ||
@@ -238,13 +279,27 @@ class AppController extends ChangeNotifier {
   }
 
   List<QuickDevice> get quickRecipients => quickDevices
-      .where(
-        (device) =>
-            device.id != deviceId &&
-            DateTime.now().difference(device.updatedAt) <
-                const Duration(minutes: 2),
-      )
+      // The local device store intentionally keeps offline recipients.  A
+      // direct send performs an authenticated probe at start time; a relay
+      // send can be queued for an offline recipient.
+      .where((device) => device.id != deviceId)
       .toList(growable: false);
+
+  bool get canUseDirectQuickTransfer =>
+      !Platform.isAndroid && _directTransferServer?.isRunning == true;
+
+  String? get directTransferEndpoint => _directTransferServer?.endpoint;
+
+  bool quickDeviceCanUseDirect(QuickDevice device) =>
+      device.supportsDirectTransfer;
+
+  Future<void> setQuickTransferMode(QuickTransferMode value) async {
+    quickTransferMode = value;
+    if (_preferencesReady) {
+      await _preferences.setString(_quickTransferModeKey, value.name);
+    }
+    notifyListeners();
+  }
 
   bool canClaimQuickTransfer(QuickTransferManifest manifest) =>
       !manifest.isClaimed && manifest.targetDevice == deviceId;
@@ -274,6 +329,7 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     try {
       _preferences = await SharedPreferences.getInstance();
+      _preferencesReady = true;
       isDarkTheme = _preferences.getBool('dark_theme') ?? false;
       sortField = FileSortField.values.byName(
         _preferences.getString(_sortFieldKey) ?? FileSortField.name.name,
@@ -281,6 +337,7 @@ class AppController extends ChangeNotifier {
       sortAscending = _preferences.getBool(_sortAscendingKey) ?? true;
       localRoot = _preferences.getString(_rootKey) ?? r'E:\Repository';
       await _loadDefaultQuickSaveDirectory();
+      quickTransferMode = _quickTransferModeFromPreferences();
       mode = RepositoryMode.values.byName(
         _preferences.getString(_modeKey) ??
             (Platform.isWindows
@@ -288,7 +345,20 @@ class AppController extends ChangeNotifier {
                 : RepositoryMode.sftp.name),
       );
       if (mode == RepositoryMode.sftp) await _loadSftpProfile();
+      // Quick transfer identity, peer metadata, and the desktop direct
+      // receiver do not depend on the repository session.  Initialize them
+      // before connecting so the quick page remains useful while SFTPGo is
+      // offline and desktop-to-desktop direct sends can still work.
+      await _loadQuickIdentity();
+      await _loadCachedQuickDevices();
+      await _cleanupOrphanDirectSources();
+      await _startDirectTransferServer();
       await connect();
+      if (!isReady) {
+        // Keep direct-server maintenance alive even when the repository could
+        // not be reached during startup.
+        unawaited(_initializeQuickTransferSafely());
+      }
       if (isReady) unawaited(_restorePendingTransfersSafely());
     } catch (exception) {
       error = describeError(exception);
@@ -297,6 +367,14 @@ class AppController extends ChangeNotifier {
       isInitializing = false;
       notifyListeners();
     }
+  }
+
+  QuickTransferMode _quickTransferModeFromPreferences() {
+    final saved = _preferences.getString(_quickTransferModeKey);
+    return QuickTransferMode.values.firstWhere(
+      (value) => value.name == saved,
+      orElse: () => QuickTransferMode.direct,
+    );
   }
 
   Future<void> _restorePendingTransfersSafely() async {
@@ -359,17 +437,22 @@ class AppController extends ChangeNotifier {
     defaultQuickSaveDirectory = clean;
     await _preferences.setString(_quickSaveDirectoryKey, clean);
     notifyListeners();
-    // The save directory controls whether this desktop advertises the direct
-    // photo capability.  Publish the changed registration immediately when a
-    // connection is already active; reconnecting is not required for peers
-    // to observe a newly enabled (or restarted) receiver.
-    if (isReady && deviceId.isNotEmpty) {
+    // The save directory controls whether this desktop advertises the generic
+    // direct capability.  The receiver is independent of the repository;
+    // publish the changed registration immediately when possible.
+    if (deviceId.isNotEmpty) {
       try {
-        await _startPhotoTransferServer();
-        await _publishDeviceRegistration();
-        await refreshQuickTransfer(refreshDevices: true);
+        await _startDirectTransferServer();
+        await _cacheLocalQuickDevice();
+        if (isReady) {
+          await _publishDeviceRegistration();
+          await refreshQuickTransfer(refreshDevices: true);
+        } else {
+          notifyListeners();
+        }
       } catch (exception) {
-        quickError = describeError(exception);
+        directTransferError = describeError(exception);
+        photoTransferError = directTransferError;
         notifyListeners();
       }
     }
@@ -451,6 +534,16 @@ class AppController extends ChangeNotifier {
         final id = record['id'] as String;
         recordId = id;
         final kind = record['kind'] as String;
+        // Direct sends deliberately do not participate in restart recovery.
+        // Drop a record written by an older build instead of accidentally
+        // replaying it through the reliable relay path.
+        if (kind == 'quick' &&
+            (record['actualRoute'] == QuickTransferRoute.direct.name ||
+                record['route'] == QuickTransferRoute.direct.name)) {
+          recordsChanged = true;
+          _pendingTransferRecords.remove(id);
+          continue;
+        }
         _pendingTransferRecords[id] = record;
         if (kind == 'download') {
           final target = File(record['targetPath'] as String);
@@ -551,6 +644,9 @@ class AppController extends ChangeNotifier {
           continue;
         }
         final source = File(record['sourcePath'] as String);
+        final requestedQuickMode = kind == 'quick'
+            ? _quickModeFromRecord(record)
+            : null;
         final task = TransferTask(
           id: id,
           name: record['name'] as String,
@@ -559,6 +655,8 @@ class AppController extends ChangeNotifier {
               : TransferDirection.upload,
           totalBytes: (record['totalBytes'] as num).toInt(),
           status: TransferStatus.failed,
+          requestedMode: requestedQuickMode,
+          route: kind == 'quick' ? QuickTransferRoute.reliableRelay : null,
           error: await source.exists() ? '上次传输未完成，可以继续重试。' : '原文件已不存在，无法继续传输。',
         );
         tasks.add(task);
@@ -571,6 +669,8 @@ class AppController extends ChangeNotifier {
               targetDevice: targetDevice,
               task: retryTask,
               name: task.name,
+              requestedMode: requestedQuickMode!,
+              actualRoute: QuickTransferRoute.reliableRelay,
             );
             _quickSendQueue.add(queued);
             _syncForegroundTransfer(force: true);
@@ -640,6 +740,15 @@ class AppController extends ChangeNotifier {
     await _persistPendingTransfers();
   }
 
+  QuickTransferMode _quickModeFromRecord(Map<String, Object?> record) {
+    final value = record['requestedMode'] ?? record['mode'];
+    return QuickTransferMode.values.firstWhere(
+      (mode) => mode.name == value,
+      // Records written before route metadata existed were relay transfers.
+      orElse: () => QuickTransferMode.reliableRelay,
+    );
+  }
+
   Future<void> _forgetPending(String id) async {
     if (_pendingTransferRecords.remove(id) != null) {
       await _persistPendingTransfers();
@@ -657,11 +766,18 @@ class AppController extends ChangeNotifier {
     return write;
   }
 
-  Future<_DurableSource> _prepareDurableSource(File source, String id) async {
-    if (!Platform.isAndroid) return _DurableSource(source, owned: false);
+  Future<_DurableSource> _prepareDurableSource(
+    File source,
+    String id, {
+    bool forceCopy = false,
+    String storageDirectory = 'pending-transfer-sources',
+  }) async {
+    if (!Platform.isAndroid && !forceCopy) {
+      return _DurableSource(source, owned: false);
+    }
     final support = await getApplicationSupportDirectory();
     final directory = Directory(
-      '${support.path}${Platform.pathSeparator}pending-transfer-sources',
+      '${support.path}${Platform.pathSeparator}$storageDirectory',
     );
     await directory.create(recursive: true);
     final target = File(
@@ -671,11 +787,24 @@ class AppController extends ChangeNotifier {
     return _DurableSource(target, owned: true);
   }
 
+  Future<void> _cleanupOrphanDirectSources() async {
+    try {
+      final support = await getApplicationSupportDirectory();
+      final directory = Directory(
+        '${support.path}${Platform.pathSeparator}direct-transfer-sources',
+      );
+      if (await directory.exists()) await directory.delete(recursive: true);
+    } catch (_) {
+      // Direct transfers do not support restart recovery; an inaccessible
+      // stale staging directory should not prevent the app from opening.
+    }
+  }
+
   Future<void> _loadSftpProfile() async {
     final host = _preferences.getString(_hostKey);
     final username = _preferences.getString(_usernameKey);
     final fingerprint = _preferences.getString(_fingerprintKey);
-    final password = await _secureStorage.read(key: _passwordKey);
+    final password = await _secretVault.read(_passwordKey);
     if (host == null ||
         username == null ||
         fingerprint == null ||
@@ -733,7 +862,7 @@ class AppController extends ChangeNotifier {
           profile.hostKeyFingerprint,
         );
         await _preferences.setString(_modeKey, mode.name);
-        await _secureStorage.write(key: _passwordKey, value: profile.password);
+        await _secretVault.write(_passwordKey, profile.password);
       },
     );
   }
@@ -765,7 +894,6 @@ class AppController extends ChangeNotifier {
       isLoading = false;
       notifyListeners();
       await previous?.dispose();
-      await _stopPhotoTransferServer();
       unawaited(_initializeQuickTransferSafely());
     } catch (_) {
       await candidate.dispose();
@@ -805,7 +933,6 @@ class AppController extends ChangeNotifier {
     error = null;
     notifyListeners();
     try {
-      await _stopPhotoTransferServer();
       await _gateway?.dispose();
       if (mode == RepositoryMode.local) {
         _gateway = LocalRepositoryGateway(localRoot);
@@ -883,13 +1010,12 @@ class AppController extends ChangeNotifier {
     _quickInitializationActive = true;
     try {
       await _initializeQuickTransfer(generation);
-      if (generation != _quickSessionGeneration || !isReady) return;
+      if (generation != _quickSessionGeneration) return;
       quickError = null;
       _restartQuickMaintenanceTimer(allowDuringInitialization: true);
       notifyListeners();
     } catch (exception) {
-      if (generation != _quickSessionGeneration || !isReady) return;
-      await _stopPhotoTransferServer();
+      if (generation != _quickSessionGeneration) return;
       quickError = describeError(exception);
       notifyListeners();
     } finally {
@@ -908,7 +1034,7 @@ class AppController extends ChangeNotifier {
     _quickMaintenanceInProgress = true;
     final generation = _quickSessionGeneration;
     try {
-      await _startPhotoTransferServer();
+      await _startDirectTransferServer();
       await _publishDeviceRegistration();
       await refreshQuickTransfer(refreshDevices: true);
     } catch (exception) {
@@ -920,45 +1046,114 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> _startPhotoTransferServer() async {
+  Future<void> _startDirectTransferServer() {
+    final existing = _directServerStartFuture;
+    if (existing != null) return existing;
+    final operation = _startDirectTransferServerInternal();
+    _directServerStartFuture = operation;
+    unawaited(
+      operation.whenComplete(() {
+        if (identical(_directServerStartFuture, operation)) {
+          _directServerStartFuture = null;
+        }
+      }),
+    );
+    return operation;
+  }
+
+  Future<void> _startDirectTransferServerInternal() async {
     if (!Platform.isWindows && !Platform.isMacOS) {
+      directTransferError = null;
       photoTransferError = null;
       return;
     }
-    if (_photoTransferServer?.isRunning == true) return;
-    await _stopPhotoTransferServer();
-    if (defaultQuickSaveDirectory == null) {
-      photoTransferError = '请先设置快传接收默认保存目录。';
+    if (_directTransferServer?.isRunning == true) {
+      directTransferError = null;
+      photoTransferError = null;
       return;
     }
-    var token = _preferences.getString(_photoTokenKey);
-    if (token == null || token.length < 64) {
-      token = _newPhotoToken();
-      await _preferences.setString(_photoTokenKey, token);
-    }
-    final server = PhotoTransferServer(
-      token: token,
-      saveDirectoryProvider: () async => defaultQuickSaveDirectory,
-    );
+    await _stopDirectTransferServer();
+    DirectTransferServer? server;
     try {
+      final token = await _loadOrCreateDirectToken();
+      server =
+          _directTransferServerFactory?.call(
+            token: token,
+            saveDirectoryProvider: () async => defaultQuickSaveDirectory,
+            port: directTransferPort,
+          ) ??
+          DirectTransferServer(
+            token: token,
+            port: directTransferPort,
+            saveDirectoryProvider: () async => defaultQuickSaveDirectory,
+            legacyPhotoCompatibility: true,
+          );
       if (await server.start()) {
-        _photoTransferServer = server;
+        _directTransferServer = server;
+        directTransferError = null;
         photoTransferError = null;
       } else {
-        photoTransferError = '未检测到 Tailscale 地址，照片直传暂不可用。';
+        directTransferError = '未检测到 Tailscale 地址，直连快传暂不可用。';
+        photoTransferError = directTransferError;
+        await server.stop();
       }
     } on SocketException {
-      photoTransferError = '照片直传服务启动失败，请确认 Tailscale 正常运行。';
+      directTransferError = '直连快传服务启动失败，请确认 Tailscale 正常运行。';
+      photoTransferError = directTransferError;
+      await server?.stop();
+    } catch (exception) {
+      directTransferError = describeError(exception);
+      photoTransferError = directTransferError;
+      await server?.stop();
     }
   }
 
-  Future<void> _stopPhotoTransferServer() async {
-    final server = _photoTransferServer;
-    _photoTransferServer = null;
+  Future<void> _stopDirectTransferServer() async {
+    final server = _directTransferServer;
+    _directTransferServer = null;
     if (server != null) await server.stop();
   }
 
-  String _newPhotoToken() => List<String>.generate(
+  Future<String> _loadOrCreateDirectToken() async {
+    try {
+      var token = _usableDirectToken(await _directTransferSecretStore.read());
+      final legacyToken = _usableDirectToken(
+        _preferences.getString(_photoTokenKey),
+      );
+      if (token == null) {
+        token = legacyToken ?? _newDirectToken();
+        // A legacy preference is removed only after this write succeeds. This
+        // makes the migration recoverable without ever enabling a receiver
+        // whose token was written to plaintext preferences.
+        await _directTransferSecretStore.write(token);
+      }
+      if (_preferences.containsKey(_photoTokenKey)) {
+        await _preferences.remove(_photoTokenKey);
+      }
+      return token;
+    } on DirectTransferSecretException {
+      rethrow;
+    } catch (exception) {
+      throw DirectTransferSecretException(
+        '直连快传需要可用的系统安全存储，当前不可用。',
+        cause: exception,
+      );
+    }
+  }
+
+  String? _usableDirectToken(String? value) {
+    final token = value?.trim();
+    if (token == null ||
+        token.isEmpty ||
+        token.length < 64 ||
+        token.contains('\r') ||
+        token.contains('\n')) {
+      return null;
+    }
+    return token;
+  }
+
+  String _newDirectToken() => List<String>.generate(
     32,
     (_) => Random.secure().nextInt(0x100).toRadixString(16).padLeft(2, '0'),
   ).join();
@@ -966,10 +1161,12 @@ class AppController extends ChangeNotifier {
   Future<void> onAppResumed() async {
     if (hasActiveTransfers || isLoading) return;
     if (!isReady) {
+      unawaited(_startDirectTransferServer());
       await connect();
       return;
     }
     await refresh();
+    unawaited(_startDirectTransferServer());
     unawaited(_maintainQuickPresence());
   }
 
@@ -1109,15 +1306,17 @@ class AppController extends ChangeNotifier {
         .toList(growable: false);
     if (!replaced) return;
     quickInbox = updated;
-    _quickManifestCache[
-      '$_quickRoot/$_quickMessages/${replacement.id}/manifest.json'
-    ] = replacement;
+    _quickManifestCache['$_quickRoot/$_quickMessages/${replacement.id}/manifest.json'] =
+        replacement;
     notifyListeners();
   }
 
   /// Converts implementation exceptions into safe, actionable user messages.
   /// Raw exception details are deliberately never presented in the UI.
   String describeError(Object exception) {
+    if (exception is DirectTransferSecretException) {
+      return exception.message;
+    }
     final message = exception.toString();
     final normalized = message.toLowerCase();
 
@@ -1196,8 +1395,16 @@ class AppController extends ChangeNotifier {
   Future<void> _initializeQuickTransfer(int generation) async {
     await _loadQuickIdentity();
     if (generation != _quickSessionGeneration) return;
-    await _startPhotoTransferServer();
+    await _loadCachedQuickDevices();
     if (generation != _quickSessionGeneration) return;
+    await _startDirectTransferServer();
+    if (generation != _quickSessionGeneration) return;
+    await _cacheLocalQuickDevice();
+    if (generation != _quickSessionGeneration) return;
+    // A disconnected repository must not block the quick page or direct
+    // receiver.  Relay directories and presence are simply deferred until a
+    // gateway is available.
+    if (!isReady || _gateway == null) return;
     await _ensureQuickDirectories(generation: generation);
     if (generation != _quickSessionGeneration) return;
     await _publishDeviceRegistration();
@@ -1211,8 +1418,91 @@ class AppController extends ChangeNotifier {
     _lastQuickPresenceUpdate = null;
     _lastQuickDeviceRefresh = null;
     _quickManifestCache.clear();
-    quickDevices = const [];
+    // Keep the persistent peer list across repository reconnects.  Only the
+    // repository-backed inbox is invalidated here.
     quickInbox = const [];
+  }
+
+  Future<void> _loadCachedQuickDevices() async {
+    List<QuickDevice> cached;
+    try {
+      cached = await _quickDeviceStore.load();
+    } catch (_) {
+      // A headless test may not have Flutter bindings/plugins. Cached peer
+      // metadata is best-effort; secrets are never recovered from ordinary
+      // preferences when secure storage is unavailable.
+      cached = const <QuickDevice>[];
+    }
+    if (_disposed) return;
+    quickDevices = _mergeQuickDevices(quickDevices, cached);
+    notifyListeners();
+  }
+
+  Future<void> _storeQuickDevice(QuickDevice device) async {
+    try {
+      await _quickDeviceStore.upsert(device);
+    } catch (_) {
+      // Keep metadata usable without Flutter bindings/plugins (for example
+      // in a headless scheduler test).
+    }
+  }
+
+  Future<void> _storeQuickDevices(Iterable<QuickDevice> devices) async {
+    try {
+      await _quickDeviceStore.merge(devices);
+    } catch (_) {
+      // See [_storeQuickDevice].
+    }
+  }
+
+  List<QuickDevice> _mergeQuickDevices(
+    Iterable<QuickDevice> existing,
+    Iterable<QuickDevice> incoming,
+  ) {
+    final merged = <String, QuickDevice>{
+      for (final device in existing) device.id: device,
+    };
+    for (final device in incoming) {
+      final previous = merged[device.id];
+      merged[device.id] = previous == null
+          ? device
+          : _mergeQuickDevice(previous, device);
+    }
+    final result = merged.values.toList(growable: false);
+    result.sort(
+      (left, right) =>
+          left.name.toLowerCase().compareTo(right.name.toLowerCase()),
+    );
+    return result;
+  }
+
+  QuickDevice _mergeQuickDevice(QuickDevice previous, QuickDevice incoming) {
+    // The store performs the same token-preserving merge while persisting;
+    // this in-memory merge keeps a metadata-only registration from hiding a
+    // token loaded by an earlier scan.
+    final directContextChanged =
+        previous.directEndpoint != incoming.directEndpoint ||
+        !incoming.canReceiveDirect;
+    final photoContextChanged =
+        previous.photoEndpoint != incoming.photoEndpoint;
+    return QuickDevice(
+      id: incoming.id,
+      name: incoming.name,
+      updatedAt: incoming.updatedAt,
+      platform: incoming.platform,
+      directEndpoint: incoming.directEndpoint,
+      directToken:
+          incoming.directToken ??
+          (directContextChanged ? null : previous.directToken),
+      protocol: incoming.protocol ?? previous.protocol,
+      protocolVersion: incoming.protocolVersion,
+      canReceiveDirect: incoming.canReceiveDirect,
+      canReceiveRelay: incoming.canReceiveRelay,
+      photoEndpoint: incoming.photoEndpoint,
+      photoToken:
+          incoming.photoToken ??
+          (photoContextChanged ? null : previous.photoToken),
+    );
   }
 
   Future<void> _loadQuickIdentity() async {
@@ -1243,8 +1533,13 @@ class AppController extends ChangeNotifier {
     if (clean.isEmpty) return;
     deviceName = clean;
     await _preferences.setString(_deviceNameKey, clean);
-    await _publishDeviceRegistration();
-    await refreshQuickTransfer(refreshDevices: true);
+    await _startDirectTransferServer();
+    if (isReady) {
+      await _publishDeviceRegistration();
+      await refreshQuickTransfer(refreshDevices: true);
+    } else {
+      await _loadCachedQuickDevices();
+    }
   }
 
   Future<void> _ensureQuickDirectories({int? generation}) async {
@@ -1289,14 +1584,9 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _publishDeviceRegistration() async {
-    final photoServer = _photoTransferServer;
-    final registration = QuickDevice(
-      id: deviceId,
-      name: deviceName,
-      updatedAt: DateTime.now(),
-      photoEndpoint: photoServer?.endpoint,
-      photoToken: photoServer?.isRunning == true ? photoServer!.token : null,
-    );
+    final registration = _localQuickDevice();
+    quickDevices = _mergeQuickDevices(quickDevices, [registration]);
+    await _storeQuickDevice(registration);
     final source = await _writeQuickJson(
       'quick-device-$deviceId.json',
       registration.toJson(),
@@ -1314,6 +1604,43 @@ class AppController extends ChangeNotifier {
     } finally {
       if (await source.exists()) await source.delete();
     }
+  }
+
+  QuickDevicePlatform get _quickDevicePlatform {
+    if (Platform.isWindows) return QuickDevicePlatform.windows;
+    if (Platform.isMacOS) return QuickDevicePlatform.macos;
+    if (Platform.isAndroid) return QuickDevicePlatform.android;
+    if (Platform.isLinux) return QuickDevicePlatform.linux;
+    if (Platform.isIOS) return QuickDevicePlatform.ios;
+    return QuickDevicePlatform.unknown;
+  }
+
+  QuickDevice _localQuickDevice() {
+    final directServer = _directTransferServer;
+    final canReceiveDirect =
+        !Platform.isAndroid &&
+        directServer?.isRunning == true &&
+        defaultQuickSaveDirectory != null;
+    return QuickDevice(
+      id: deviceId,
+      name: deviceName,
+      updatedAt: DateTime.now(),
+      platform: _quickDevicePlatform,
+      photoEndpoint: canReceiveDirect ? directServer?.endpoint : null,
+      photoToken: canReceiveDirect ? directServer?.token : null,
+      directEndpoint: directServer?.endpoint,
+      directToken: directServer?.token,
+      protocol: canReceiveDirect ? QuickDeviceProtocol.directV1 : null,
+      canReceiveDirect: canReceiveDirect,
+      canReceiveRelay: true,
+    );
+  }
+
+  Future<void> _cacheLocalQuickDevice() async {
+    final registration = _localQuickDevice();
+    await _storeQuickDevice(registration);
+    quickDevices = _mergeQuickDevices(quickDevices, [registration]);
+    notifyListeners();
   }
 
   Future<String> _readQuickText(String remotePath) async {
@@ -1339,7 +1666,13 @@ class AppController extends ChangeNotifier {
 
   Future<void> refreshQuickTransfer({bool refreshDevices = false}) async {
     final gateway = _gateway;
-    if (gateway == null || deviceId.isEmpty) {
+    if (deviceId.isEmpty) {
+      return;
+    }
+    if (gateway == null) {
+      // Repository metadata is unavailable, but the persistent device cache
+      // remains valid for offline relay selection and direct probing.
+      await _loadCachedQuickDevices();
       return;
     }
     if (_quickMutationInProgress) {
@@ -1396,15 +1729,16 @@ class AppController extends ChangeNotifier {
               }
             } catch (_) {}
           }
+          discovered.sort(
+            (left, right) =>
+                left.name.toLowerCase().compareTo(right.name.toLowerCase()),
+          );
+          await _storeQuickDevices(discovered);
+          registered = _mergeQuickDevices(registered, discovered);
+          _lastQuickDeviceRefresh = DateTime.now();
         } catch (_) {
           // Device names are optional metadata. Continue loading messages.
         }
-        discovered.sort(
-          (left, right) =>
-              left.name.toLowerCase().compareTo(right.name.toLowerCase()),
-        );
-        registered = discovered;
-        _lastQuickDeviceRefresh = DateTime.now();
       }
       final inbox = <QuickTransferManifest>[];
       try {
@@ -1835,7 +2169,9 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> retryTask(TransferTask task) async {
-    if (task.status != TransferStatus.failed) return;
+    if (task.status != TransferStatus.failed || !task.canRetryFromStart) {
+      return;
+    }
     final action = _retryActions[task.id];
     if (action == null) return;
     task.transferredBytes = 0;
@@ -1848,7 +2184,7 @@ class AppController extends ChangeNotifier {
   void pauseTask(TransferTask task) {
     if (task.status != TransferStatus.running ||
         task.isPaused ||
-        !task.supportsPause) {
+        !task.canPause) {
       return;
     }
     task.isPaused = true;
@@ -1863,7 +2199,9 @@ class AppController extends ChangeNotifier {
   }
 
   void resumeTask(TransferTask task) {
-    if (task.status != TransferStatus.running || !task.isPaused) {
+    if (task.status != TransferStatus.running ||
+        !task.isPaused ||
+        !task.canResume) {
       return;
     }
     if (task.direction == TransferDirection.quickSend) {
@@ -1893,6 +2231,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> cancelTask(TransferTask task) async {
+    if (!task.canCancel) return;
     final pausedQuick = _pausedQuickTransfers.remove(task.id);
     if (pausedQuick != null) {
       task
@@ -1941,19 +2280,37 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _runTaskCleanup(String taskId) async {
-    _completionCleanupActions.remove(taskId);
-    final cleanup = _cleanupActions.remove(taskId);
-    if (cleanup == null) return;
-    try {
-      await cleanup();
-    } catch (_) {
-      // Cleanup is best-effort and is retried by repository maintenance.
+    final cleanup = _cleanupActions[taskId];
+    if (cleanup != null) {
+      try {
+        await cleanup();
+        _cleanupActions.remove(taskId);
+      } catch (_) {
+        // Keep the action registered. The finally path and a later explicit
+        // cleanup can retry after a transient repository/filesystem failure.
+      }
+    }
+    final completionCleanup = _completionCleanupActions[taskId];
+    if (completionCleanup != null) {
+      try {
+        await completionCleanup();
+        _completionCleanupActions.remove(taskId);
+      } catch (_) {
+        // Retain it for a later task removal/cleanup attempt.
+      }
     }
   }
 
   Future<void> _runCompletionCleanup(String taskId) async {
-    final cleanup = _completionCleanupActions.remove(taskId);
-    if (cleanup != null) await cleanup();
+    final cleanup = _completionCleanupActions[taskId];
+    if (cleanup == null) return;
+    try {
+      await cleanup();
+      _completionCleanupActions.remove(taskId);
+    } catch (_) {
+      // The payload has already been delivered. A staging-file cleanup error
+      // must not turn a successful transfer into a failed transfer.
+    }
   }
 
   void removeTask(TransferTask task) {
@@ -1964,8 +2321,8 @@ class AppController extends ChangeNotifier {
     }
     tasks.remove(task);
     _retryActions.remove(task.id);
+    _directReceipts.remove(task.id);
     unawaited(_runTaskCleanup(task.id));
-    _completionCleanupActions.remove(task.id);
     unawaited(_forgetPending(task.id));
     _taskSettled.remove(task.id);
     notifyListeners();
@@ -1982,6 +2339,7 @@ class AppController extends ChangeNotifier {
     for (final task in finished) {
       tasks.remove(task);
       _retryActions.remove(task.id);
+      _directReceipts.remove(task.id);
       await _runTaskCleanup(task.id);
       await _forgetPending(task.id);
       _taskSettled.remove(task.id);
@@ -2006,34 +2364,43 @@ class AppController extends ChangeNotifier {
     String? originalName,
     String? mimeType,
     bool isPhoto = false,
+    QuickTransferMode? requestedMode,
+    QuickTransferMode? mode,
   }) async {
     final target = targetDevice.trim();
     if (target.isEmpty || target == deviceId) {
       throw ArgumentError('Cannot send a quick transfer to this device.');
     }
+    if (requestedMode != null && mode != null && requestedMode != mode) {
+      throw ArgumentError('requestedMode and mode must match.');
+    }
+    final legacyPhotoPath = isPhoto && requestedMode == null && mode == null;
+    var selectedMode = requestedMode ?? mode ?? quickTransferMode;
     final name = sanitizeTransferFileName(
       originalName ?? source.uri.pathSegments.last,
     );
     QuickDevice? recipient = quickRecipients
         .where((item) => item.id == target)
         .firstOrNull;
-    if (isPhoto && (recipient == null || !recipient.supportsPhotoTransfer)) {
-      // Device registrations are deliberately cached for ordinary inbox
-      // refreshes, but a photo send must confirm the receiver's current
-      // capability before creating a running task.  This covers a desktop
-      // that has just selected its save directory and republished its token.
+    if (isReady &&
+        (recipient == null ||
+            (legacyPhotoPath && !recipient.supportsPhotoTransfer))) {
       await refreshQuickTransfer(refreshDevices: true);
       recipient = quickRecipients
           .where((item) => item.id == target)
           .firstOrNull;
     }
+    if (recipient == null) await _loadCachedQuickDevices();
+    recipient ??= quickRecipients
+        .where((item) => item.id == target)
+        .firstOrNull;
     if (recipient == null) {
       throw ArgumentError(
         'The target device is unavailable or belongs to this device.',
       );
     }
     await validateTransferSelection([source]);
-    if (isPhoto) {
+    if (isPhoto && legacyPhotoPath) {
       final selectedMime = normalizeMimeType(mimeType);
       if (!isSupportedPhotoTransfer(name: name, mimeType: selectedMime)) {
         throw StateError('照片必须同时具有受支持的图片扩展名和 MIME 类型。');
@@ -2041,6 +2408,9 @@ class AppController extends ChangeNotifier {
       if (!recipient.supportsPhotoTransfer) {
         throw const PhotoTransferException('目标设备尚未启用照片直传，请先设置默认保存目录并保持目标应用打开。');
       }
+      // Keep the old /v1/photo path working for callers that still pass
+      // isPhoto without an explicit mode. The new UI always supplies a
+      // requested mode and uses the generic direct/relay routes below.
       return _publishPhotoTransfer(
         source,
         targetDevice: target,
@@ -2049,6 +2419,138 @@ class AppController extends ChangeNotifier {
         recipient: recipient,
       );
     }
+    // Android is a sender-only endpoint in phase one. It may still receive
+    // relay packages, but an explicit direct request must not silently change
+    // route (the UI hides that option for Android recipients).
+    if (recipient.platform == QuickDevicePlatform.android &&
+        selectedMode == QuickTransferMode.direct) {
+      throw const DirectTransferException('目标设备不支持直连快传。');
+    }
+    if (selectedMode == QuickTransferMode.reliableRelay &&
+        !recipient.supportsRelayTransfer) {
+      throw const DirectTransferException('目标设备不支持可靠中转。');
+    }
+    final actualRoute = await _selectQuickTransferRoute(
+      requestedMode: selectedMode,
+      recipient: recipient,
+    );
+    if (actualRoute == QuickTransferRoute.direct) {
+      return _publishDirectTransfer(
+        source,
+        targetDevice: target,
+        name: name,
+        mimeType: mimeType,
+        recipient: recipient,
+        requestedMode: selectedMode,
+      );
+    }
+    return _publishRelayTransfer(
+      source,
+      targetDevice: target,
+      name: name,
+      requestedMode: selectedMode,
+    );
+  }
+
+  Future<QuickTransferRoute> _selectQuickTransferRoute({
+    required QuickTransferMode requestedMode,
+    required QuickDevice recipient,
+  }) async {
+    if (requestedMode == QuickTransferMode.direct) {
+      await _requireDirectRecipient(recipient);
+      return QuickTransferRoute.direct;
+    }
+    try {
+      await _preflightReliableRelay();
+      return QuickTransferRoute.reliableRelay;
+    } catch (exception) {
+      // Route switching is allowed only for a pre-start, explicit network
+      // outage. Authentication, host-key, permission, and disk failures stay
+      // on relay and are surfaced to the user.
+      if (!_isExplicitNetworkUnavailable(exception)) rethrow;
+      final probe = await _probeDirectRecipient(recipient);
+      if (probe?.canReceive == true) return QuickTransferRoute.direct;
+      throw DirectTransferException(
+        probe?.error ?? '可靠中转当前不可用，目标设备也无法直连。',
+        statusCode: probe?.statusCode,
+        cause: exception,
+      );
+    }
+  }
+
+  Future<void> _requireDirectRecipient(QuickDevice recipient) async {
+    if (!recipient.supportsDirectTransfer) {
+      throw const DirectTransferException('目标设备不支持直连快传。');
+    }
+    final probe = await _probeDirectRecipient(recipient);
+    if (probe?.canReceive != true) {
+      throw DirectTransferException(
+        probe?.error ?? '目标设备当前不在线，无法直连快传。',
+        statusCode: probe?.statusCode,
+      );
+    }
+  }
+
+  Future<DirectTransferProbeResult?> _probeDirectRecipient(
+    QuickDevice recipient,
+  ) async {
+    if (!recipient.supportsDirectTransfer) return null;
+    return _directTransferClient.probe(
+      endpoint: recipient.directEndpoint!,
+      token: recipient.directToken!,
+    );
+  }
+
+  Future<void> _preflightReliableRelay() async {
+    final gateway = _gateway;
+    if (gateway == null || !isReady) {
+      if (mode == RepositoryMode.sftp && sftpProfile == null) {
+        throw StateError('请先完成 SFTPGo 连接配置，才能使用可靠中转。');
+      }
+      if (mode == RepositoryMode.local) {
+        throw StateError('本地仓库当前不可用，无法使用可靠中转。');
+      }
+      final current = error?.trim();
+      if (current != null &&
+          current.isNotEmpty &&
+          _isExplicitNetworkUnavailable(StateError(current))) {
+        throw SocketException(current);
+      }
+      throw StateError(
+        current?.isNotEmpty == true ? current! : 'SFTPGo 当前不可用，请检查连接配置。',
+      );
+    }
+    // This is read-only. Listing the repository root is intentional: the
+    // SFTP statvfs extension used by [availableBytes] is optional and the
+    // gateway therefore treats its errors as "unknown". The root listing
+    // still proves that Windows/SFTPGo is reachable before we create a
+    // package, while the space check below remains useful when supported.
+    await _retryOperation(() => gateway.listDirectory(''));
+    await _retryOperation(() => gateway.availableBytes(_quickRoot));
+  }
+
+  bool _isExplicitNetworkUnavailable(Object exception) {
+    if (exception is SocketException || exception is TimeoutException) {
+      return true;
+    }
+    final normalized = exception.toString().toLowerCase();
+    return normalized.contains('failed host lookup') ||
+        normalized.contains('no address associated') ||
+        normalized.contains('connection timed out') ||
+        normalized.contains('connection refused') ||
+        normalized.contains('network is unreachable') ||
+        normalized.contains('host is unreachable') ||
+        normalized.contains('网络不可达') ||
+        normalized.contains('连接超时') ||
+        normalized.contains('连接被拒绝');
+  }
+
+  Future<QuickTransferManifest> _publishRelayTransfer(
+    File source, {
+    required String targetDevice,
+    required String name,
+    required QuickTransferMode requestedMode,
+  }) async {
     final taskId = uniqueSuffix();
     final durableSource = await _prepareDurableSource(source, taskId);
     final task = TransferTask(
@@ -2057,13 +2559,18 @@ class AppController extends ChangeNotifier {
       direction: TransferDirection.quickSend,
       totalBytes: await durableSource.file.length(),
       status: TransferStatus.queued,
+      requestedMode: requestedMode,
+      route: QuickTransferRoute.reliableRelay,
+      capabilities: const TransferTaskCapabilities.reliableRelay(),
     );
     tasks.insert(0, task);
     final queued = _QueuedQuickTransfer(
       source: durableSource.file,
-      targetDevice: target,
+      targetDevice: targetDevice,
       task: task,
       name: name,
+      requestedMode: requestedMode,
+      actualRoute: QuickTransferRoute.reliableRelay,
     );
     _quickSendQueue.add(queued);
     _syncForegroundTransfer(force: true);
@@ -2084,14 +2591,18 @@ class AppController extends ChangeNotifier {
       'ownedSource': durableSource.owned,
       'name': task.name,
       'totalBytes': task.totalBytes,
-      'targetDevice': target,
+      'targetDevice': targetDevice,
+      'requestedMode': requestedMode.name,
+      'actualRoute': QuickTransferRoute.reliableRelay.name,
     });
     _retryActions[task.id] = (retryTask) async {
       final retry = _QueuedQuickTransfer(
         source: durableSource.file,
-        targetDevice: target,
+        targetDevice: targetDevice,
         task: retryTask,
         name: task.name,
+        requestedMode: requestedMode,
+        actualRoute: QuickTransferRoute.reliableRelay,
       );
       _quickSendQueue.add(retry);
       notifyListeners();
@@ -2102,6 +2613,149 @@ class AppController extends ChangeNotifier {
 
     unawaited(_processQuickSendQueue());
     return queued.completer.future;
+  }
+
+  Future<QuickTransferManifest> _publishDirectTransfer(
+    File source, {
+    required String targetDevice,
+    required String name,
+    required String? mimeType,
+    required QuickDevice recipient,
+    required QuickTransferMode requestedMode,
+  }) async {
+    final taskId = uniqueSuffix();
+    final durableSource = await _prepareDurableSource(
+      source,
+      taskId,
+      forceCopy: true,
+      storageDirectory: 'direct-transfer-sources',
+    );
+    final task = TransferTask(
+      id: taskId,
+      name: name,
+      direction: TransferDirection.quickSend,
+      totalBytes: await durableSource.file.length(),
+      status: TransferStatus.queued,
+      requestedMode: requestedMode,
+      route: QuickTransferRoute.direct,
+      capabilities: const TransferTaskCapabilities.direct(),
+    );
+    tasks.insert(0, task);
+    _cleanupActions[task.id] = durableSource.deleteIfOwned;
+    _completionCleanupActions[task.id] = durableSource.deleteIfOwned;
+    _retryActions[task.id] = (retryTask) => _runDirectTask(
+      retryTask,
+      source: durableSource.file,
+      targetDevice: targetDevice,
+      name: name,
+      mimeType: mimeType,
+      recipient: recipient,
+      probe: true,
+    );
+    notifyListeners();
+    // Route selection already performed the authenticated probe. Retries run
+    // the same probe again so a recovered/changed receiver is never assumed
+    // to be online.
+    await _runDirectTask(
+      task,
+      source: durableSource.file,
+      targetDevice: targetDevice,
+      name: name,
+      mimeType: mimeType,
+      recipient: recipient,
+      probe: false,
+    );
+    if (task.status == TransferStatus.cancelled) {
+      throw const TransferCancelled();
+    }
+    final receipt = _directReceipts[task.id];
+    if (task.status == TransferStatus.failed || receipt == null) {
+      throw DirectTransferException(task.error ?? '直连快传失败。');
+    }
+    return quickTransfer.describe(
+      durableSource.file,
+      name: receipt.name,
+      size: receipt.size,
+      checksum: receipt.sha256,
+      senderDevice: deviceId,
+      targetDevice: targetDevice,
+      transferId: task.id,
+    );
+  }
+
+  Future<void> _runDirectTask(
+    TransferTask task, {
+    required File source,
+    required String targetDevice,
+    required String name,
+    required String? mimeType,
+    required QuickDevice recipient,
+    required bool probe,
+  }) async {
+    final control = TransferControl();
+    _transferControls[task.id] = control;
+    _directReceipts.remove(task.id);
+    _syncForegroundTransfer(force: true);
+    task
+      ..status = TransferStatus.running
+      ..error = null
+      ..cancelRequested = false
+      ..isPaused = false;
+    notifyListeners();
+    try {
+      if (probe) await _requireDirectRecipient(recipient);
+      final receipt = await _directTransferClient.send(
+        endpoint: recipient.directEndpoint!,
+        token: recipient.directToken!,
+        source: source,
+        fileName: name,
+        mimeType: mimeType,
+        control: control,
+        onProgress: (current, total) {
+          task.transferredBytes = current;
+          _notifyTransferProgress();
+        },
+      );
+      task
+        ..transferredBytes = receipt.size
+        ..status = TransferStatus.completed;
+      _directReceipts[task.id] = receipt;
+      _cleanupActions.remove(task.id);
+      await _runCompletionCleanup(task.id);
+    } on TransferCancelled {
+      _directReceipts.remove(task.id);
+      task
+        ..status = TransferStatus.cancelled
+        ..cancelRequested = true
+        ..isPaused = false;
+      rethrow;
+    } catch (exception) {
+      if (control.isCancelled || task.cancelRequested) {
+        _directReceipts.remove(task.id);
+        task
+          ..status = TransferStatus.cancelled
+          ..isPaused = false;
+        throw const TransferCancelled();
+      }
+      task
+        ..status = TransferStatus.failed
+        ..error = exception is DirectTransferException
+            ? exception.message
+            : describeError(exception);
+      rethrow;
+    } finally {
+      if (identical(_transferControls[task.id], control)) {
+        _transferControls.remove(task.id);
+      }
+      if (task.status == TransferStatus.cancelled) {
+        // A cancellation can race the caller's cleanup while the source file
+        // is still open. Run it once more after the HTTP stream has closed so
+        // the in-memory durable retry copy does not survive a cancelled send.
+        await _runTaskCleanup(task.id);
+      }
+      _syncForegroundTransfer(force: true);
+      notifyListeners();
+    }
   }
 
   Future<QuickTransferManifest> _publishPhotoTransfer(
@@ -2122,6 +2776,9 @@ class AppController extends ChangeNotifier {
       totalBytes: await source.length(),
       status: TransferStatus.running,
       supportsPause: false,
+      requestedMode: QuickTransferMode.direct,
+      route: QuickTransferRoute.direct,
+      capabilities: const TransferTaskCapabilities.direct(),
     );
     tasks.insert(0, task);
     final control = TransferControl();
@@ -2918,8 +3575,9 @@ class AppController extends ChangeNotifier {
     _quickRefreshGeneration++;
     _quickMaintenanceTimer?.cancel();
     _transferUiTimer?.cancel();
-    unawaited(_stopPhotoTransferServer());
+    unawaited(_stopDirectTransferServer());
     unawaited(_photoTransferClient.dispose());
+    unawaited(_directTransferClient.dispose());
     _gateway?.dispose();
     super.dispose();
   }
@@ -2931,12 +3589,16 @@ class _QueuedQuickTransfer {
     required this.targetDevice,
     required this.task,
     required this.name,
+    this.requestedMode = QuickTransferMode.reliableRelay,
+    this.actualRoute = QuickTransferRoute.reliableRelay,
   });
 
   final File source;
   final String targetDevice;
   final TransferTask task;
   final String name;
+  final QuickTransferMode requestedMode;
+  final QuickTransferRoute actualRoute;
   final Completer<QuickTransferManifest> completer =
       Completer<QuickTransferManifest>();
 }

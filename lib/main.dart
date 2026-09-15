@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'app_controller.dart';
 import 'core/models/file_entry.dart';
+import 'core/models/quick_device.dart';
 import 'core/models/transfer_task.dart';
 import 'core/path_utils.dart';
 import 'core/photo_transfer.dart';
@@ -157,7 +158,6 @@ class _RepositoryPageState extends State<RepositoryPage>
     final wide = MediaQuery.sizeOf(context).width >= 840;
     final content = switch (_page) {
       0 => _repositoryView(),
-      1 when !controller.isReady => _connectionRequired(),
       1 => _quickTransferView(),
       _ => _taskView(),
     };
@@ -368,10 +368,7 @@ class _RepositoryPageState extends State<RepositoryPage>
     if (!mounted || controller.isReady) return;
 
     final tailscaleActive = await TailscaleBridge.isActive();
-    final shouldOpenTailscale = Platform.isAndroid
-        ? !tailscaleActive
-        : controller.needsTailscale && !tailscaleActive;
-    if (!mounted || !shouldOpenTailscale) return;
+    if (!mounted || tailscaleActive) return;
 
     _message('未检测到 Tailscale 连接，正在打开 Tailscale…');
     await Future<void>.delayed(const Duration(milliseconds: 350));
@@ -662,6 +659,12 @@ class _RepositoryPageState extends State<RepositoryPage>
       final selected = recipients.any((device) => device.id == _quickTarget)
           ? _quickTarget
           : (recipients.isEmpty ? null : recipients.first.id);
+      final selectedDevice = selected == null
+          ? null
+          : recipients.firstWhere(
+              (device) => device.id == selected,
+              orElse: () => recipients.first,
+            );
       return RefreshIndicator(
         onRefresh: () => controller.refreshQuickTransfer(refreshDevices: true),
         child: ListView(
@@ -677,8 +680,6 @@ class _RepositoryPageState extends State<RepositoryPage>
                         '快速传输',
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
-                      const SizedBox(height: 4),
-                      const Text('照片直达默认目录，其他文件可靠中转并自动校验。'),
                     ],
                   ),
                 ),
@@ -692,6 +693,13 @@ class _RepositoryPageState extends State<RepositoryPage>
             ),
             const SizedBox(height: 24),
             _quickIdentityBar(),
+            if (controller.quickError case final quickError?) ...[
+              const SizedBox(height: 12),
+              Text(
+                quickError,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
             const SizedBox(height: 16),
             DropTarget(
               onDragDone: (detail) async {
@@ -699,6 +707,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                 await _sendQuickFiles(
                   detail.files.map((item) => File(item.path)).toList(),
                   targetDevice: selected,
+                  requestedMode: _effectiveQuickTransferMode(selectedDevice),
                 );
               },
               child: DecoratedBox(
@@ -747,73 +756,26 @@ class _RepositoryPageState extends State<RepositoryPage>
                                   setState(() => _quickTarget = value ?? ''),
                       ),
                       const SizedBox(height: 16),
-                      if (Platform.isAndroid)
-                        compact
-                            ? Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  FilledButton.icon(
-                                    onPressed: selected == null
-                                        ? null
-                                        : () => _pickQuickMedia(selected),
-                                    icon: const Icon(Icons.perm_media_outlined),
-                                    label: const Text('传图片或视频'),
-                                  ),
-                                  const SizedBox(height: 10),
-                                  OutlinedButton.icon(
-                                    onPressed: selected == null
-                                        ? null
-                                        : () => _pickQuickFiles(selected),
-                                    icon: const Icon(
-                                      Icons.attach_file_outlined,
-                                    ),
-                                    label: const Text('传其他文件'),
-                                  ),
-                                ],
-                              )
-                            : Wrap(
-                                spacing: 12,
-                                runSpacing: 12,
-                                children: [
-                                  FilledButton.icon(
-                                    onPressed: selected == null
-                                        ? null
-                                        : () => _pickQuickMedia(selected),
-                                    icon: const Icon(Icons.perm_media_outlined),
-                                    label: const Text('传图片或视频'),
-                                  ),
-                                  OutlinedButton.icon(
-                                    onPressed: selected == null
-                                        ? null
-                                        : () => _pickQuickFiles(selected),
-                                    icon: const Icon(
-                                      Icons.attach_file_outlined,
-                                    ),
-                                    label: const Text('传其他文件'),
-                                  ),
-                                ],
-                              )
-                      else
-                        FilledButton.icon(
-                          onPressed: selected == null
-                              ? null
-                              : () => _pickQuickFiles(selected),
-                          icon: const Icon(Icons.attach_file_outlined),
-                          label: const Text('选择文件'),
-                        ),
+                      _quickModeSelector(selectedDevice),
+                      const SizedBox(height: 16),
+                      FilledButton.icon(
+                        onPressed: selected == null
+                            ? null
+                            : () => _pickQuickFiles(
+                                selected,
+                                requestedMode: _effectiveQuickTransferMode(
+                                  selectedDevice,
+                                ),
+                              ),
+                        icon: const Icon(Icons.attach_file_outlined),
+                        label: const Text('选择文件'),
+                      ),
                     ],
                   ),
                 ),
               ),
             ),
             const SizedBox(height: 28),
-            if (controller.quickError case final quickError?) ...[
-              Text(
-                quickError,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-              const SizedBox(height: 16),
-            ],
             Row(
               children: [
                 Text('收件箱', style: Theme.of(context).textTheme.titleLarge),
@@ -837,6 +799,41 @@ class _RepositoryPageState extends State<RepositoryPage>
   );
 
   String _quickTarget = '';
+
+  QuickTransferMode _effectiveQuickTransferMode(QuickDevice? target) {
+    if (target != null && !controller.quickDeviceCanUseDirect(target)) {
+      return QuickTransferMode.reliableRelay;
+    }
+    return controller.quickTransferMode;
+  }
+
+  Widget _quickModeSelector(QuickDevice? target) {
+    final directAvailable =
+        target == null || controller.quickDeviceCanUseDirect(target);
+    final selected = _effectiveQuickTransferMode(target);
+    return RadioGroup<QuickTransferMode>(
+      groupValue: selected,
+      onChanged: (value) {
+        if (value != null) unawaited(controller.setQuickTransferMode(value));
+      },
+      child: Row(
+        children: [
+          if (directAvailable)
+            _quickModeOption(QuickTransferMode.direct, '直连快传'),
+          if (directAvailable) const SizedBox(width: 20),
+          _quickModeOption(QuickTransferMode.reliableRelay, '可靠中转'),
+        ],
+      ),
+    );
+  }
+
+  Widget _quickModeOption(QuickTransferMode mode, String label) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Radio<QuickTransferMode>(value: mode),
+      Text(label),
+    ],
+  );
 
   Widget _quickIdentityBar() => DecoratedBox(
     decoration: BoxDecoration(
@@ -994,7 +991,10 @@ class _RepositoryPageState extends State<RepositoryPage>
     }
   }
 
-  Future<void> _pickQuickFiles(String targetDevice) async {
+  Future<void> _pickQuickFiles(
+    String targetDevice, {
+    QuickTransferMode? requestedMode,
+  }) async {
     final files = await openFiles(
       acceptedTypeGroups: const [
         XTypeGroup(label: '所有文件', extensions: <String>[]),
@@ -1003,12 +1003,19 @@ class _RepositoryPageState extends State<RepositoryPage>
     if (files.isEmpty) return;
     final materialized = await _materialize(files);
     try {
-      await _sendQuickFiles(materialized, targetDevice: targetDevice);
+      await _sendQuickFiles(
+        materialized,
+        targetDevice: targetDevice,
+        requestedMode: requestedMode,
+      );
     } finally {
       await _cleanMaterializedUploads();
     }
   }
 
+  // Kept for callers/tests that still exercise the legacy photo picker. The
+  // visible quick-transfer UI now uses the generic file picker and mode row.
+  // ignore: unused_element
   Future<void> _pickQuickMedia(String targetDevice) async {
     final selections = <_QuickFileSelection>[];
     if (Platform.isAndroid) {
@@ -1051,6 +1058,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   Future<void> _sendQuickFiles(
     List<File> files, {
     required String targetDevice,
+    QuickTransferMode? requestedMode,
     bool allowPhotoDirect = false,
     Map<String, _QuickFileSelection>? metadata,
   }) async {
@@ -1069,6 +1077,7 @@ class _RepositoryPageState extends State<RepositoryPage>
           _sendQuickFile(
             file,
             target,
+            requestedMode: requestedMode,
             allowPhotoDirect: allowPhotoDirect,
             metadata: metadata?[file.path],
           ),
@@ -1103,6 +1112,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   Future<String> _sendQuickFile(
     File file,
     String target, {
+    QuickTransferMode? requestedMode,
     bool allowPhotoDirect = false,
     _QuickFileSelection? metadata,
   }) async {
@@ -1118,6 +1128,7 @@ class _RepositoryPageState extends State<RepositoryPage>
         originalName: name,
         mimeType: mimeType,
         isPhoto: isPhoto,
+        requestedMode: requestedMode,
       );
       return 'sent';
     } on TransferCancelled {
@@ -1230,6 +1241,13 @@ class _RepositoryPageState extends State<RepositoryPage>
           Text(
             '${_formatBytes(task.transferredBytes)} / ${_formatBytes(task.totalBytes)}',
           ),
+          if (task.actualRoute != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              _quickRouteLabel(task.actualRoute!),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
           if (task.error != null) ...[
             const SizedBox(height: 4),
             Text(
@@ -1248,7 +1266,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (task.status == TransferStatus.running &&
-                          task.supportsPause) ...[
+                          task.canPause) ...[
                         OutlinedButton.icon(
                           onPressed: task.isPaused
                               ? () => controller.resumeTask(task)
@@ -1262,18 +1280,20 @@ class _RepositoryPageState extends State<RepositoryPage>
                         ),
                         const SizedBox(width: 8),
                       ],
-                      OutlinedButton.icon(
-                        onPressed: () => controller.cancelTask(task),
-                        icon: const Icon(Icons.cancel_outlined),
-                        label: const Text('取消并清理'),
-                      ),
+                      if (task.canCancel)
+                        OutlinedButton.icon(
+                          onPressed: () => controller.cancelTask(task),
+                          icon: const Icon(Icons.cancel_outlined),
+                          label: const Text('取消并清理'),
+                        ),
                     ],
                   )
                 : Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (task.status == TransferStatus.failed &&
-                          controller.canRetryTask(task)) ...[
+                          controller.canRetryTask(task) &&
+                          task.canRetryFromStart) ...[
                         FilledButton.icon(
                           onPressed: () => _retryTask(task),
                           icon: const Icon(Icons.refresh),
@@ -1293,6 +1313,11 @@ class _RepositoryPageState extends State<RepositoryPage>
       ),
     ),
   );
+
+  String _quickRouteLabel(QuickTransferRoute route) => switch (route) {
+    QuickTransferRoute.direct => '直连快传',
+    QuickTransferRoute.reliableRelay => '可靠中转',
+  };
 
   Future<void> _pickUpload() async {
     final files = await openFiles(
@@ -1640,7 +1665,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
-                    if (controller.photoTransferError case final warning?) ...[
+                    if (controller.directTransferError case final warning?) ...[
                       const SizedBox(height: 6),
                       Align(
                         alignment: Alignment.centerLeft,

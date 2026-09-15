@@ -2,23 +2,25 @@
 
 Jet2Drop 是一个面向个人设备的三端文件仓库客户端，用于在 Windows、macOS 和 Android 之间浏览、传输和管理文件。
 
-Windows 电脑保存实际仓库并运行 SFTPGo；三端通过同一个 Tailscale 私有网络互联。普通文件通过 SFTP 和 Windows 仓库可靠中转，照片可以在目标桌面端在线时直接传入其默认保存目录。
+Windows 电脑保存实际仓库并运行 SFTPGo，三端通过同一个 Tailscale 私有网络互联。快传发送页提供一行两个四字选项“直连快传 / 可靠中转”，默认选择直连：直连支持任意文件，但接收端必须在线；可靠中转使用 Windows/SFTPGo 暂存，支持离线领取、暂停、续传和恢复。第一阶段 Android 暂不作为直连接收端，因此发往 Android 只显示“可靠中转”；Windows 和 macOS 可以接收直连，Windows、macOS、Android 三端均可发送。
+
+设备列表不依赖 Tailscale 未公开的跨应用设备列表。Jet2Drop 会自动持久化已经发现的 Jet2Drop 设备，并在发送前直接探测目标的接收服务；不使用二维码。设计和行为说明以当前真实实现为准。
 
 ## 运行环境
 
-- Windows 10/11：运行 Tailscale、SFTPGo 和 Jet2Drop。
-- macOS 12 或更高：运行 Tailscale 和 Jet2Drop。
-- Android 8.0（API 24）或更高：运行 Tailscale 和 Jet2Drop。
-- 三台设备需加入同一个 Tailnet。
+- Windows 10/11：运行 Tailscale、SFTPGo 和 Jet2Drop，可作为直连接收端。
+- macOS 12 或更高：运行 Tailscale 和 Jet2Drop，可作为直连接收端。
+- Android 8.0（API 24）或更高：运行 Tailscale 和 Jet2Drop；第一阶段只能作为可靠中转的接收端，仍可发送文件。
+- 需要加入同一个 Tailnet。Android→Mac 的直连不依赖 Windows 在线；仓库和可靠中转仍依赖 Windows/SFTPGo。
 
-需求目标和部署背景见 [Jet2Drop 项目需求与开发方案.md](Jet2Drop%20项目需求与开发方案.md)；详细设计和功能行为以当前真实实现为准。
+需求目标和部署背景见 [Jet2Drop 项目需求与开发方案.md](Jet2Drop%20项目需求与开发方案.md)；详细设计和功能行为以当前真实实现为准。未正式发布前，应用版本保持 `0.0.0+0`。
 
 ## 首次连接
 
-1. 确认 Windows 已启动 Tailscale 和 SFTPGo，客户端设备也已连接 Tailscale。
+1. 确认客户端设备已连接 Tailscale；需要浏览仓库或使用可靠中转时，再确认 Windows 已启动且 SFTPGo 正常运行。
 2. 打开 Jet2Drop，进入“连接设置”。
 3. 选择 `SFTPGo`，填写 Windows 的 Tailscale IP 或 MagicDNS 主机名、SFTP 端口、用户名、密码和主机密钥指纹。
-4. 桌面端选择快传默认保存目录。
+4. Windows 或 macOS 作为直连接收端时，在设置中选择快传默认保存目录。
 5. 点击“保存并连接”。
 
 密码等敏感信息只应存入系统安全存储，不要写入仓库或提交到 Git。
@@ -27,28 +29,7 @@ Windows 电脑保存实际仓库并运行 SFTPGo；三端通过同一个 Tailsca
 
 - “仓库”页用于浏览目录、排序、刷新、上传、下载、预览和文件管理。
 - Windows 和 macOS 支持从资源管理器或 Finder 拖入文件上传。
-- “快传”页选择在线设备并发送文件。照片直传要求目标桌面应用在线；其他文件可由接收端稍后领取。
-- “任务”页可查看进度，并对支持的任务执行暂停、继续、取消、重试和清理。
-- 普通仓库下载由用户选择保存位置；快传领取和照片接收使用桌面端记忆的默认保存目录。
-
-## 开发与构建
-
-项目使用 Flutter。提交前运行：
-
-```bash
-flutter pub get
-flutter analyze
-flutter test
-```
-
-构建对应平台的 Release：
-
-```bash
-flutter build macos --release
-flutter build windows --release
-flutter build apk --release
-```
-
-Windows 可在项目目录运行 `powershell -ExecutionPolicy Bypass -File .\tools\deploy_windows.ps1` 完成构建和部署；仅部署已有构建时追加 `-SkipBuild`。
-
-未正式发布前，应用版本保持 `0.0.0+0`。
+- “快传”页先选择目标设备和文件，再在同一行选择“直连快传 / 可靠中转”；默认是“直连快传”。直连发送任意文件，目标 Windows/macOS Jet2Drop 必须在线，传输可取消，失败只能从头重试，不支持暂停、断点或重启恢复，也不会自动改走中转。接收时使用 `.part`、SHA-256 校验和原子改名。
+- “可靠中转”在 Windows/SFTPGo 可达时将文件暂存到独立快传区，接收端可以离线领取，并支持暂停、续传和重启恢复。若开始前确认 Windows/SFTPGo 不可达，则对支持直连且在线的目标自动切换直连；链路一旦开始就不再切换。发往 Android 第一阶段只显示“可靠中转”。
+- “任务”页按传输链路显示进度和可用操作：直连支持取消与失败重试，中转支持暂停、继续、取消、续传恢复、重试和清理。
+- 普通仓库下载由用户选择保存位置；桌面端快传接收使用已记忆的默认保存目录，Android 领取可靠中转使用 Android 系统文件选择器。

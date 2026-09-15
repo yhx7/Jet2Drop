@@ -23,8 +23,51 @@ class MainFlutterWindow: NSWindow {
     registerLifecycleChannel(
       with: flutterViewController.engine.binaryMessenger
     )
+    registerTailscaleChannel(
+      with: flutterViewController.engine.binaryMessenger
+    )
 
     super.awakeFromNib()
+  }
+
+  private func registerTailscaleChannel(
+    with messenger: FlutterBinaryMessenger
+  ) {
+    let channel = FlutterMethodChannel(
+      name: "jet2drop/tailscale",
+      binaryMessenger: messenger
+    )
+    channel.setMethodCallHandler { call, result in
+      guard call.method == "openTailscale" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+
+      let workspace = NSWorkspace.shared
+      let bundleIdentifiers = [
+        "io.tailscale.ipn.macos",
+        "io.tailscale.ipn.macsys",
+      ]
+      let applicationURL = bundleIdentifiers.compactMap {
+        workspace.urlForApplication(withBundleIdentifier: $0)
+      }.first ?? URL(fileURLWithPath: "/Applications/Tailscale.app")
+
+      guard FileManager.default.fileExists(atPath: applicationURL.path) else {
+        result(false)
+        return
+      }
+
+      let configuration = NSWorkspace.OpenConfiguration()
+      configuration.activates = true
+      workspace.openApplication(
+        at: applicationURL,
+        configuration: configuration
+      ) { _, error in
+        DispatchQueue.main.async {
+          result(error == nil)
+        }
+      }
+    }
   }
 
   private func registerLifecycleChannel(

@@ -8,7 +8,9 @@ import 'package:jet2drop/core/models/quick_device.dart';
 import 'package:jet2drop/core/models/transfer_task.dart';
 import 'package:jet2drop/core/photo_transfer.dart';
 import 'package:jet2drop/core/quick_transfer.dart';
+import 'package:jet2drop/core/repository_gateway.dart';
 import 'package:jet2drop/core/transfer_control.dart';
+import 'package:jet2drop/infrastructure/sftp_repository_gateway.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -327,6 +329,7 @@ void main() {
     final send = controller.publishQuickTransfer(
       source,
       targetDevice: 'target-device',
+      requestedMode: QuickTransferMode.reliableRelay,
     );
     for (var attempt = 0; attempt < 200; attempt++) {
       if (controller.hasActiveTransfers) break;
@@ -538,6 +541,7 @@ void main() {
     final manifest = await controller.publishQuickTransfer(
       source,
       targetDevice: targetId,
+      requestedMode: QuickTransferMode.reliableRelay,
     );
     controller.deviceId = targetId;
     controller.quickDevices = [
@@ -635,6 +639,7 @@ void main() {
         targetDevice: 'target-device',
         originalName: 'other.jpg',
         mimeType: 'image/jpeg',
+        requestedMode: QuickTransferMode.reliableRelay,
       );
       expect(
         await File(
@@ -834,6 +839,7 @@ void main() {
       final manifest = await controller.publishQuickTransfer(
         source,
         targetDevice: targetId,
+        requestedMode: QuickTransferMode.reliableRelay,
       );
       controller.deviceId = targetId;
       controller.quickDevices = [
@@ -970,9 +976,7 @@ void main() {
       '${Platform.pathSeparator}messages${Platform.pathSeparator}double-claim',
     );
     await package.create(recursive: true);
-    final payload = File(
-      '${package.path}${Platform.pathSeparator}payload.bin',
-    );
+    final payload = File('${package.path}${Platform.pathSeparator}payload.bin');
     await payload.writeAsBytes([7]);
     final validChecksum = await QuickTransferService().checksum(payload);
     final manifest = QuickTransferManifest(
@@ -1132,7 +1136,7 @@ void main() {
     },
   );
 
-  test('quick recipients contain only other recently seen devices', () async {
+  test('quick recipients retain known devices while offline', () async {
     final controller = AppController()..deviceId = 'self';
     addTearDown(controller.dispose);
     controller.quickDevices = [
@@ -1145,7 +1149,10 @@ void main() {
       ),
     ];
 
-    expect(controller.quickRecipients.map((device) => device.id), ['fresh']);
+    expect(controller.quickRecipients.map((device) => device.id), [
+      'fresh',
+      'stale',
+    ]);
     expect(controller.quickDeviceName('unknown'), '未知设备');
   });
 
@@ -1179,6 +1186,7 @@ void main() {
       final firstSend = controller.publishQuickTransfer(
         first,
         targetDevice: 'target-device',
+        requestedMode: QuickTransferMode.reliableRelay,
       );
       final firstCancelled = expectLater(
         firstSend,
@@ -1205,7 +1213,11 @@ void main() {
       expect(firstTask.isPaused, isTrue);
 
       final secondManifest = await controller
-          .publishQuickTransfer(second, targetDevice: 'target-device')
+          .publishQuickTransfer(
+            second,
+            targetDevice: 'target-device',
+            requestedMode: QuickTransferMode.reliableRelay,
+          )
           .timeout(const Duration(seconds: 30));
       await controller.refreshQuickTransfer();
       expect(
@@ -1220,6 +1232,289 @@ void main() {
       expect(firstTask.status, TransferStatus.cancelled);
     },
   );
+
+  test(
+    'quick mode defaults to direct and persists the explicit selection',
+    () async {
+      final root = await Directory.systemTemp.createTemp('jet2drop-mode-');
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      SharedPreferences.setMockInitialValues({
+        'repository_mode': RepositoryMode.local.name,
+        'local_root': repository.path,
+        'quick_transfer_mode': QuickTransferMode.reliableRelay.name,
+      });
+      final controller = AppController();
+      await controller.initialize();
+      addTearDown(controller.dispose);
+      expect(controller.quickTransferMode, QuickTransferMode.reliableRelay);
+      await controller.setQuickTransferMode(QuickTransferMode.direct);
+      final preferences = await SharedPreferences.getInstance();
+      expect(
+        preferences.getString('quick_transfer_mode'),
+        QuickTransferMode.direct.name,
+      );
+    },
+  );
+
+  test(
+    'direct quick send probes, exposes direct capabilities and is not persisted',
+    () async {
+      final root = await Directory.systemTemp.createTemp('jet2drop-direct-');
+      addTearDown(() => root.delete(recursive: true));
+      final repository = Directory('${root.path}${Platform.pathSeparator}repo');
+      await repository.create();
+      final source = File('${root.path}${Platform.pathSeparator}payload.bin');
+      await source.writeAsBytes([1, 2, 3, 4]);
+      SharedPreferences.setMockInitialValues({
+        'repository_mode': RepositoryMode.local.name,
+        'local_root': repository.path,
+      });
+      final direct = _FakeDirectTransferClient();
+      final controller = AppController(directTransferClient: direct);
+      await controller.initialize();
+      addTearDown(controller.dispose);
+      controller.quickDevices = [
+        QuickDevice(
+          id: 'target-device',
+          name: '直连目标',
+          updatedAt: DateTime.now(),
+          directEndpoint: 'http://127.0.0.1:37123',
+          directToken: 'target-token',
+          protocol: QuickDeviceProtocol.directV1,
+          canReceiveDirect: true,
+        ),
+      ];
+
+      final manifest = await controller.publishQuickTransfer(
+        source,
+        targetDevice: 'target-device',
+        requestedMode: QuickTransferMode.direct,
+      );
+      final task = controller.tasks.singleWhere(
+        (item) => item.id == manifest.id,
+      );
+      expect(direct.probeCount, 1);
+      expect(direct.sendCount, 1);
+      expect(task.actualRoute, QuickTransferRoute.direct);
+      expect(task.canPause, isFalse);
+      expect(task.canResume, isFalse);
+      expect(task.canRestartRecovery, isFalse);
+      expect(task.canCancel, isTrue);
+      expect(task.canRetryFromStart, isTrue);
+      expect(
+        (await SharedPreferences.getInstance()).getString(
+          'pending_transfers_v1',
+        ),
+        isNot(contains(task.id)),
+      );
+    },
+  );
+
+  test(
+    'an explicit direct request to Android is rejected instead of downgraded',
+    () async {
+      final root = await Directory.systemTemp.createTemp('jet2drop-android-');
+      addTearDown(() => root.delete(recursive: true));
+      final source = File('${root.path}${Platform.pathSeparator}payload.bin');
+      await source.writeAsBytes([1, 2, 3]);
+      final direct = _FakeDirectTransferClient();
+      final controller = AppController(directTransferClient: direct)
+        ..deviceId = 'sender'
+        ..quickDevices = [
+          QuickDevice(
+            id: 'android-target',
+            name: 'Android 设备',
+            platform: QuickDevicePlatform.android,
+            updatedAt: DateTime.now(),
+          ),
+        ];
+      addTearDown(controller.dispose);
+
+      await expectLater(
+        controller.publishQuickTransfer(
+          source,
+          targetDevice: 'android-target',
+          requestedMode: QuickTransferMode.direct,
+        ),
+        throwsA(isA<DirectTransferException>()),
+      );
+      expect(direct.probeCount, 0);
+      expect(controller.tasks, isEmpty);
+    },
+  );
+
+  test(
+    'reliable relay falls back to direct only for a pre-start outage',
+    () async {
+      final root = await Directory.systemTemp.createTemp('jet2drop-fallback-');
+      addTearDown(() => root.delete(recursive: true));
+      final source = File('${root.path}${Platform.pathSeparator}payload.bin');
+      await source.writeAsBytes([5, 6, 7]);
+      final direct = _FakeDirectTransferClient();
+      final controller = AppController(directTransferClient: direct)
+        ..deviceId = 'sender'
+        ..mode = RepositoryMode.sftp
+        ..sftpProfile = const SftpConnectionProfile(
+          host: '100.64.0.1',
+          port: 2022,
+          username: 'test',
+          password: 'test',
+          hostKeyFingerprint: 'SHA256:test',
+        )
+        ..isReady = false
+        ..error = 'Connection refused'
+        ..quickDevices = [
+          QuickDevice(
+            id: 'target-device',
+            name: '直连目标',
+            updatedAt: DateTime.now(),
+            directEndpoint: 'http://127.0.0.1:37123',
+            directToken: 'target-token',
+            canReceiveDirect: true,
+          ),
+        ];
+      addTearDown(controller.dispose);
+
+      final manifest = await controller.publishQuickTransfer(
+        source,
+        targetDevice: 'target-device',
+        requestedMode: QuickTransferMode.reliableRelay,
+      );
+      final task = controller.tasks.singleWhere(
+        (item) => item.id == manifest.id,
+      );
+      expect(task.requestedMode, QuickTransferMode.reliableRelay);
+      expect(task.actualRoute, QuickTransferRoute.direct);
+      expect(direct.probeCount, 1);
+    },
+  );
+
+  test(
+    'relay outage fails before task creation when direct target is unavailable',
+    () async {
+      final root = await Directory.systemTemp.createTemp('jet2drop-no-route-');
+      addTearDown(() => root.delete(recursive: true));
+      final source = File('${root.path}${Platform.pathSeparator}payload.bin');
+      await source.writeAsBytes([5, 6, 7]);
+      final direct = _FakeDirectTransferClient(canReceive: false);
+      final controller = AppController(directTransferClient: direct)
+        ..deviceId = 'sender'
+        ..mode = RepositoryMode.sftp
+        ..sftpProfile = const SftpConnectionProfile(
+          host: '100.64.0.1',
+          port: 2022,
+          username: 'test',
+          password: 'test',
+          hostKeyFingerprint: 'SHA256:test',
+        )
+        ..isReady = false
+        ..error = 'Network is unreachable'
+        ..quickDevices = [
+          QuickDevice(
+            id: 'target-device',
+            name: '离线目标',
+            updatedAt: DateTime.now(),
+            directEndpoint: 'http://127.0.0.1:37123',
+            directToken: 'target-token',
+            canReceiveDirect: true,
+          ),
+        ];
+      addTearDown(controller.dispose);
+
+      await expectLater(
+        controller.publishQuickTransfer(
+          source,
+          targetDevice: 'target-device',
+          requestedMode: QuickTransferMode.reliableRelay,
+        ),
+        throwsA(isA<DirectTransferException>()),
+      );
+      expect(direct.probeCount, 1);
+      expect(direct.sendCount, 0);
+      expect(controller.tasks, isEmpty);
+    },
+  );
+
+  test('relay authentication failure never switches to direct', () async {
+    final root = await Directory.systemTemp.createTemp('jet2drop-auth-');
+    addTearDown(() => root.delete(recursive: true));
+    final source = File('${root.path}${Platform.pathSeparator}payload.bin');
+    await source.writeAsBytes([8]);
+    final direct = _FakeDirectTransferClient();
+    final controller = AppController(directTransferClient: direct)
+      ..deviceId = 'sender'
+      ..isReady = false
+      ..error = '身份验证失败。请检查密码。'
+      ..quickDevices = [
+        QuickDevice(
+          id: 'target-device',
+          name: '目标设备',
+          updatedAt: DateTime.now(),
+          directEndpoint: 'http://127.0.0.1:37123',
+          directToken: 'target-token',
+          canReceiveDirect: true,
+        ),
+      ];
+    addTearDown(controller.dispose);
+
+    await expectLater(
+      controller.publishQuickTransfer(
+        source,
+        targetDevice: 'target-device',
+        requestedMode: QuickTransferMode.reliableRelay,
+      ),
+      throwsStateError,
+    );
+    expect(direct.probeCount, 0);
+    expect(controller.tasks, isEmpty);
+  });
 }
 
 class _RealHttpOverrides extends HttpOverrides {}
+
+class _FakeDirectTransferClient extends DirectTransferClient {
+  _FakeDirectTransferClient({this.canReceive = true});
+
+  final bool canReceive;
+  int probeCount = 0;
+  int sendCount = 0;
+
+  @override
+  Future<DirectTransferProbeResult> probe({
+    required String endpoint,
+    required String token,
+    Duration? timeout,
+  }) async {
+    probeCount++;
+    return DirectTransferProbeResult(
+      isOnline: true,
+      supportsDirectReceive: canReceive,
+      endpoint: endpoint,
+      protocolVersion: directTransferProtocolVersion,
+    );
+  }
+
+  @override
+  Future<DirectTransferReceipt> send({
+    required String endpoint,
+    required String token,
+    required File source,
+    String? fileName,
+    String? mimeType,
+    String? sha256,
+    String? expectedSha256,
+    ProgressCallback? onProgress,
+    TransferControl? control,
+  }) async {
+    sendCount++;
+    final size = await source.length();
+    onProgress?.call(size, size);
+    return DirectTransferReceipt(
+      name: fileName ?? source.uri.pathSegments.last,
+      size: size,
+      sha256: await QuickTransferService().checksum(source),
+    );
+  }
+}

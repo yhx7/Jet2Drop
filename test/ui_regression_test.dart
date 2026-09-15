@@ -104,6 +104,10 @@ void main() {
     await tester.tap(find.text('快速传输').last);
     await tester.pump();
     expect(find.text('发送到设备'), findsOneWidget);
+    expect(find.text('直连快传'), findsOneWidget);
+    expect(find.text('可靠中转'), findsOneWidget);
+    await tester.drag(find.byType(ListView), const Offset(0, -420));
+    await tester.pump();
     expect(find.text('收件箱'), findsOneWidget);
 
     await tester.tap(find.text('任务').last);
@@ -124,7 +128,8 @@ void main() {
     await tester.pumpWidget(Jet2DropApp(controller: controller));
     await tester.tap(find.text('快速传输').last);
     await tester.pump();
-    expect(find.text('尚未连接到仓库'), findsOneWidget);
+    expect(find.text('发送到设备'), findsOneWidget);
+    expect(find.text('尚未连接到仓库'), findsNothing);
 
     controller
       ..isReady = true
@@ -133,6 +138,8 @@ void main() {
     await tester.pump();
 
     expect(find.text('发送到设备'), findsOneWidget);
+    await tester.drag(find.byType(ListView), const Offset(0, -420));
+    await tester.pump();
     expect(find.text('收件箱'), findsOneWidget);
     expect(find.text('尚未连接到仓库'), findsNothing);
   });
@@ -162,6 +169,61 @@ void main() {
 
     // The controller owns the background cadence, so stop it before the
     // widget-test binding checks for leaked timers.
+    controller.dispose();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('Android recipients expose only reliable relay mode', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = false
+      ..isReady = false
+      ..deviceId = 'this-device'
+      ..quickDevices = [
+        QuickDevice(
+          id: 'android-device',
+          name: 'Android 设备',
+          platform: QuickDevicePlatform.android,
+          updatedAt: DateTime.now(),
+        ),
+      ];
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(Jet2DropApp(controller: controller));
+    await tester.tap(find.text('快速传输').last);
+    await tester.pump();
+
+    expect(find.text('可靠中转'), findsOneWidget);
+    expect(find.text('直连快传'), findsNothing);
+    controller.dispose();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('recipients without direct capability hide direct mode', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = false
+      ..isReady = false
+      ..deviceId = 'this-device'
+      ..quickDevices = [
+        QuickDevice(
+          id: 'offline-desktop',
+          name: '未启用直连的桌面设备',
+          platform: QuickDevicePlatform.windows,
+          updatedAt: DateTime.now(),
+          canReceiveDirect: false,
+        ),
+      ];
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(Jet2DropApp(controller: controller));
+    await tester.tap(find.text('快速传输').last);
+    await tester.pump();
+
+    expect(find.text('可靠中转'), findsOneWidget);
+    expect(find.text('直连快传'), findsNothing);
     controller.dispose();
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -252,6 +314,17 @@ void main() {
           transferredBytes: 100,
           status: TransferStatus.completed,
         ),
+        TransferTask(
+          id: 'direct-failed',
+          name: 'direct.bin',
+          direction: TransferDirection.quickSend,
+          totalBytes: 100,
+          status: TransferStatus.failed,
+          route: QuickTransferRoute.direct,
+          requestedMode: QuickTransferMode.direct,
+          error: '直连失败',
+          capabilities: const TransferTaskCapabilities.direct(),
+        ),
       ]);
     addTearDown(controller.dispose);
 
@@ -271,6 +344,9 @@ void main() {
           .onPressed,
       isNotNull,
     );
+    await tester.drag(find.byType(ListView), const Offset(0, -500));
+    await tester.pump();
+    expect(find.text('直连快传'), findsOneWidget);
   });
 
   testWidgets('a cleared quick error disappears without changing pages', (
@@ -292,6 +368,8 @@ void main() {
       ..notifyListeners();
     await tester.pump();
     expect(find.text('临时读取失败'), findsNothing);
+    await tester.drag(find.byType(ListView), const Offset(0, -420));
+    await tester.pump();
     expect(find.text('收件箱'), findsOneWidget);
   });
 }

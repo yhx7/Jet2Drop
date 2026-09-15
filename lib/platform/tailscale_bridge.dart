@@ -34,14 +34,10 @@ class TailscaleBridge {
   }
 
   static Future<bool> open() async {
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isMacOS) {
       return await _channel.invokeMethod<bool>('openTailscale') ?? false;
     }
     try {
-      if (Platform.isMacOS) {
-        final result = await Process.run('open', ['-a', 'Tailscale']);
-        return result.exitCode == 0;
-      }
       if (Platform.isWindows) {
         final candidates = <String>[
           r'C:\Program Files\Tailscale\tailscale-ipn.exe',

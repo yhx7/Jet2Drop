@@ -99,8 +99,11 @@ class SftpRepositoryGateway implements RepositoryGateway {
         'Checking available space',
       );
       return stats.freeBlocksForNonRoot * stats.fundamentalBlockSize;
-    } catch (exception) {
-      // Some SFTP servers do not expose the optional statvfs extension.
+    } on SftpExtensionUnsupportedError {
+      // statvfs is an optional OpenSSH extension.
+      return null;
+    } on SftpExtensionVersionMismatchError {
+      // Treat a server-advertised incompatible extension as unavailable.
       return null;
     }
   }
