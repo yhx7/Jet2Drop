@@ -2,7 +2,15 @@ import Cocoa
 import FlutterMacOS
 
 class MainFlutterWindow: NSWindow {
+  /// Closing the main window keeps the Flutter engine alive so transfers,
+  /// presence updates, and the photo receiver can continue in the menu bar.
+  /// The app delegate restores this same window from the Dock or status item.
+  override func performClose(_ sender: Any?) {
+    orderOut(sender)
+  }
+
   override func awakeFromNib() {
+    isReleasedWhenClosed = false
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
     self.contentViewController = flutterViewController

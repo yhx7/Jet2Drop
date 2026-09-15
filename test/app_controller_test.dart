@@ -26,8 +26,22 @@ void main() {
       );
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(
+        const MethodChannel('jet2drop/macos_lifecycle'),
+        (_) async => null,
+      );
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(
         const MethodChannel('plugins.flutter.io/path_provider'),
         (_) async => pluginData.path,
+      );
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(
+        const MethodChannel('jet2drop/macos_security_scope'),
+        (call) async => switch (call.method) {
+          'restoreDirectoryAccess' => null,
+          'persistDirectoryAccess' => null,
+          _ => throw MissingPluginException(),
+        },
       );
 
   Future<void> waitForQuickInitialization(AppController controller) async {

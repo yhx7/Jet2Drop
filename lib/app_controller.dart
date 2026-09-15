@@ -61,7 +61,12 @@ class AppController extends ChangeNotifier {
   static const quickTransferActiveRefreshInterval = Duration(seconds: 15);
   static const quickTransferInactiveRefreshInterval = Duration(seconds: 45);
 
-  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage(
+    // Ad-hoc local macOS builds cannot carry the Keychain Sharing entitlement
+    // required by the data-protection Keychain. The legacy Keychain remains
+    // encrypted by macOS and persists credentials without developer signing.
+    mOptions: MacOsOptions(usesDataProtectionKeychain: false),
+  );
   final Timer Function(Duration duration, void Function(Timer) callback)
   _periodicTimerFactory;
   late SharedPreferences _preferences;

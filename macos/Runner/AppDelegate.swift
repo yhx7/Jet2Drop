@@ -116,10 +116,11 @@ final class SecurityScopedBookmarkStore {
 @main
 class AppDelegate: FlutterAppDelegate {
   private var statusItem: NSStatusItem?
+  private var statusMenu: NSMenu?
   private var hasActiveTransfers = false
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
-    super.applicationDidFinishLaunching(notification)
+    NSApp.setActivationPolicy(.regular)
     installStatusItem()
   }
 
@@ -131,7 +132,9 @@ class AppDelegate: FlutterAppDelegate {
     _ sender: NSApplication,
     hasVisibleWindows flag: Bool
   ) -> Bool {
-    showMainWindow()
+    DispatchQueue.main.async { [weak self] in
+      self?.showMainWindow()
+    }
     return true
   }
 
@@ -139,19 +142,19 @@ class AppDelegate: FlutterAppDelegate {
     _ sender: NSApplication
   ) -> NSApplication.TerminateReply {
     guard hasActiveTransfers else {
-      return super.applicationShouldTerminate(sender)
+      return .terminateNow
     }
     let alert = NSAlert()
     alert.messageText = "仍有文件正在传输"
-    alert.informativeText = "彻底退出会中断当前任务，确定退出吗？"
+    alert.informativeText = "退出会中断当前任务，确定退出吗？"
     alert.alertStyle = .warning
     alert.addButton(withTitle: "取消")
-    alert.addButton(withTitle: "彻底退出")
+    alert.addButton(withTitle: "退出")
     guard alert.runModal() == .alertSecondButtonReturn else {
       return .terminateCancel
     }
     hasActiveTransfers = false
-    return super.applicationShouldTerminate(sender)
+    return .terminateNow
   }
 
   override func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -159,9 +162,9 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   override func applicationWillTerminate(_ notification: Notification) {
+    statusMenu = nil
     statusItem = nil
     SecurityScopedBookmarkStore.shared.releaseDirectoryAccess()
-    super.applicationWillTerminate(notification)
   }
 
   func setActiveTransfers(_ active: Bool) {
@@ -173,27 +176,47 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   @objc private func showMainWindow() {
-    guard let window = NSApp.windows.first(where: { $0.canBecomeMain }) else {
+    guard let window = NSApp.windows.first(where: { $0 is MainFlutterWindow }) else {
       return
     }
-    window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
+    if window.isMiniaturized {
+      window.deminiaturize(nil)
+    }
+    window.makeKeyAndOrderFront(nil)
   }
 
   @objc private func exitApplication() {
     requestExit()
   }
 
+  @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+    guard NSApp.currentEvent?.type == .rightMouseUp,
+          let item = statusItem,
+          let menu = statusMenu else {
+      showMainWindow()
+      return
+    }
+
+    item.menu = menu
+    sender.performClick(nil)
+    item.menu = nil
+  }
+
   private func installStatusItem() {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    statusItem = item
     if let button = item.button {
-      let image = NSImage(
+      let image = (NSApp.applicationIconImage.copy() as? NSImage) ?? NSImage(
         systemSymbolName: "arrow.left.arrow.right",
         accessibilityDescription: "Jet2Drop"
-      )
-      image?.isTemplate = true
+      )!
+      image.size = NSSize(width: 18, height: 18)
       button.image = image
       button.toolTip = "Jet2Drop"
+      button.target = self
+      button.action = #selector(statusItemClicked(_:))
+      button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
     let menu = NSMenu()
     let openItem = NSMenuItem(
@@ -205,13 +228,13 @@ class AppDelegate: FlutterAppDelegate {
     menu.addItem(openItem)
     menu.addItem(.separator())
     let exitItem = NSMenuItem(
-      title: "彻底退出",
+      title: "退出 Jet2Drop",
       action: #selector(exitApplication),
       keyEquivalent: "q"
     )
     exitItem.target = self
     menu.addItem(exitItem)
-    item.menu = menu
-    statusItem = item
+    statusMenu = menu
+    item.isVisible = true
   }
 }

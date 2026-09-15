@@ -107,7 +107,7 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
           hwnd,
           L"\u4ECD\u6709\u6587\u4EF6\u6B63\u5728\u4F20\u8F93\u3002"
           L"\u9000\u51FA\u4F1A\u4E2D\u65AD\u5F53\u524D\u4EFB\u52A1\uFF0C"
-          L"\u786E\u5B9A\u5F7B\u5E95\u9000\u51FA\u5417\uFF1F",
+          L"\u786E\u5B9A\u9000\u51FA\u5417\uFF1F",
           L"Jet2Drop",
           MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
       if (choice != IDYES) {
@@ -190,7 +190,7 @@ void FlutterWindow::ShowTrayMenu() {
               L"\u6253\u5F00 Jet2Drop");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, kExitCommand,
-              L"\u5F7B\u5E95\u9000\u51FA");
+              L"\u9000\u51FA Jet2Drop");
   SetForegroundWindow(GetHandle());
   const UINT command = TrackPopupMenu(
       menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, cursor.x, cursor.y,

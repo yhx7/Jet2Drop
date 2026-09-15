@@ -8,8 +8,29 @@ class TailscaleBridge {
   static const _channel = MethodChannel('jet2drop/tailscale');
 
   static Future<bool> isActive() async {
-    if (!Platform.isAndroid) return false;
-    return await _channel.invokeMethod<bool>('isTailscaleActive') ?? false;
+    if (Platform.isAndroid) {
+      return await _channel.invokeMethod<bool>('isTailscaleActive') ?? false;
+    }
+    if (!Platform.isMacOS && !Platform.isWindows) return false;
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      return interfaces
+          .expand((interface) => interface.addresses)
+          .any(isTailscaleIpv4Address);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static bool isTailscaleIpv4Address(InternetAddress address) {
+    final bytes = address.rawAddress;
+    return bytes.length == 4 &&
+        bytes[0] == 100 &&
+        bytes[1] >= 64 &&
+        bytes[1] <= 127;
   }
 
   static Future<bool> open() async {

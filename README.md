@@ -1,21 +1,54 @@
 # Jet2Drop
 
-Jet2Drop 是 Android 与 Windows 之间使用 Tailscale 和 SFTPGo 的私人文件仓库客户端。
+Jet2Drop 是一个面向个人设备的三端文件仓库客户端，用于在 Windows、macOS 和 Android 之间浏览、传输和管理文件。
 
-当前的传输规则很明确：照片快传在接收端应用在线时，通过 Tailscale 使用标准 HTTP 直接写入接收端记忆的默认保存目录；其他所有文件（无论大小）继续使用现有可靠的 SFTP/Windows 仓库中转链路。照片直传失败不会偷偷改走另一条链路，重新选择照片后再发送即可。普通文件仍支持离线等待、暂停、取消、重试、校验和异常退出恢复。
+Windows 电脑保存实际仓库并运行 SFTPGo；三端通过同一个 Tailscale 私有网络互联。普通文件通过 SFTP 和 Windows 仓库可靠中转，照片可以在目标桌面端在线时直接传入其默认保存目录。
 
-桌面端可以在连接设置中选择默认保存目录。目录会持久记忆，也可以随时修改；正在进行的任务使用启动时的目录，新任务使用新目录。目录不存在或不可写时会明确报错，不会静默改存到其他位置。照片直传接收过程中先写 `.part`，校验成功后再原子改名，同名文件自动生成不冲突的名称。
+## 运行环境
 
-当前刻意不实现并行分片、按文件大小切换链路、复杂自定义协议、独立守护进程、推送系统或多路自动兜底。这些会增加状态和故障面，等基础链路有真实数据后再评估。
+- Windows 10/11：运行 Tailscale、SFTPGo 和 Jet2Drop。
+- macOS 12 或更高：运行 Tailscale 和 Jet2Drop。
+- Android 8.0（API 24）或更高：运行 Tailscale 和 Jet2Drop。
+- 三台设备需加入同一个 Tailnet。
 
-## 质量检查
+需求目标和部署背景见 [Jet2Drop 项目需求与开发方案.md](Jet2Drop%20项目需求与开发方案.md)；详细设计和功能行为以当前真实实现为准。
 
-提交前应依次通过 `flutter analyze`、`flutter test`、Android Release 构建与 Windows Release 构建。真实文件选择、相册保存和跨设备传输由连接的实际设备最终确认。
+## 首次连接
 
-## Windows 一键部署
+1. 确认 Windows 已启动 Tailscale 和 SFTPGo，客户端设备也已连接 Tailscale。
+2. 打开 Jet2Drop，进入“连接设置”。
+3. 选择 `SFTPGo`，填写 Windows 的 Tailscale IP 或 MagicDNS 主机名、SFTP 端口、用户名、密码和主机密钥指纹。
+4. 桌面端选择快传默认保存目录。
+5. 点击“保存并连接”。
 
-在项目目录运行 `powershell -ExecutionPolicy Bypass -File .\tools\deploy_windows.ps1`。脚本会构建正式版、只关闭部署目录中的旧进程、完整复制并校验文件，然后重新启动应用。仅部署已有构建可追加 `-SkipBuild`。
+密码等敏感信息只应存入系统安全存储，不要写入仓库或提交到 Git。
 
-## 桌面端后台运行
+## 基本使用
 
-Windows 和 macOS 关闭主窗口后仍保持 Jet2Drop 在后台运行，继续维护设备在线状态、照片接收服务和传输任务。Windows 从系统托盘、macOS 从菜单栏可以重新打开窗口或选择“彻底退出”；应用连接设置中也提供“彻底退出”。彻底退出时若仍有传输任务，应用会先要求确认。
+- “仓库”页用于浏览目录、排序、刷新、上传、下载、预览和文件管理。
+- Windows 和 macOS 支持从资源管理器或 Finder 拖入文件上传。
+- “快传”页选择在线设备并发送文件。照片直传要求目标桌面应用在线；其他文件可由接收端稍后领取。
+- “任务”页可查看进度，并对支持的任务执行暂停、继续、取消、重试和清理。
+- 普通仓库下载由用户选择保存位置；快传领取和照片接收使用桌面端记忆的默认保存目录。
+
+## 开发与构建
+
+项目使用 Flutter。提交前运行：
+
+```bash
+flutter pub get
+flutter analyze
+flutter test
+```
+
+构建对应平台的 Release：
+
+```bash
+flutter build macos --release
+flutter build windows --release
+flutter build apk --release
+```
+
+Windows 可在项目目录运行 `powershell -ExecutionPolicy Bypass -File .\tools\deploy_windows.ps1` 完成构建和部署；仅部署已有构建时追加 `-SkipBuild`。
+
+未正式发布前，应用版本保持 `0.0.0+0`。
