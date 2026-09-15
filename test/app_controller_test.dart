@@ -69,6 +69,7 @@ void main() {
       'local_root': repository.path,
     });
     final controller = AppController();
+    addTearDown(controller.shutdown);
     await controller.initialize();
     await waitForQuickInitialization(controller);
     return controller;

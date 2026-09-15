@@ -164,6 +164,8 @@ class AppController extends ChangeNotifier {
   bool _quickMutationInProgress = false;
   bool _disposed = false;
   DateTime? _lastSyncProgressNotification;
+  bool _notifierDisposed = false;
+  Future<void>? _resourceDisposalFuture;
   Completer<void>? _quickRefreshIdle;
   Future<void> _quickMutationTail = Future<void>.value();
   Future<void>? _quickInitializationFuture;
@@ -3904,19 +3906,41 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _beginShutdown();
+    unawaited(_disposeResources().catchError((_) {}));
+    if (_notifierDisposed) return;
+    _notifierDisposed = true;
+    super.dispose();
+  }
+
+  Future<void> shutdown() async {
+    _beginShutdown();
+    await _disposeResources();
+  }
+
+  void _beginShutdown() {
     if (_disposed) return;
     _disposed = true;
     _quickSessionGeneration++;
     _quickRefreshGeneration++;
     _quickMaintenanceTimer?.cancel();
     _transferUiTimer?.cancel();
-    unawaited(_stopDirectTransferServer());
-    unawaited(_photoTransferClient.dispose());
-    unawaited(_directTransferClient.dispose());
-    _gateway?.dispose();
-    _syncGateway?.dispose();
-    super.dispose();
   }
+
+  Future<void> _disposeResources() => _resourceDisposalFuture ??= () async {
+    try {
+      await _directServerStartFuture;
+    } catch (_) {
+      // Startup errors are already exposed by the regular connection state.
+    }
+    await Future.wait<void>([
+      _stopDirectTransferServer(),
+      _photoTransferClient.dispose(),
+      _directTransferClient.dispose(),
+      if (_gateway case final gateway?) gateway.dispose(),
+      if (_syncGateway case final syncGateway?) syncGateway.dispose(),
+    ]);
+  }();
 }
 
 class _QueuedQuickTransfer {
