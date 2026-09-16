@@ -56,6 +56,9 @@ class PhotoTransferServer extends DirectTransferServer {
          transferPath: photoTransferPath,
          maxBytes: photoTransferMaxBytes,
          allowEmptyFiles: false,
+         // The historical /v1/photo body stays exactly as it was: the HTTP
+         // length is the file length and the digest is optional metadata.
+         checksumTrailer: false,
          requestValidator: _validatePhotoTransfer,
        );
 
@@ -70,5 +73,10 @@ class PhotoTransferClient extends DirectTransferClient {
   PhotoTransferClient({
     super.connectionTimeout = const Duration(seconds: 12),
     super.requestTimeout = const Duration(minutes: 30),
-  }) : super(transferPath: photoTransferPath);
+  }) : super(
+         transferPath: photoTransferPath,
+         // /v1/photo keeps the version 1 request: digest pre-pass, digest in
+         // the historical header and no body trailer.
+         checksumTrailer: false,
+       );
 }

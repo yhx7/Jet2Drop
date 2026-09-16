@@ -14,13 +14,39 @@ const directTransferHealthPath = '$directTransferPath/health';
 const directTransferProbePath = directTransferHealthPath;
 const directFileTransferPath = directTransferPath;
 const directTransferMaxBytes = 10 * 1024 * 1024 * 1024;
-const directTransferProtocolVersion = 1;
+
+/// Generic direct-transfer protocol version.
+///
+/// Version 2 streams the file bytes as the first `File-Length` bytes of the
+/// request body and appends the lower-case SHA-256 as a fixed 64-byte ASCII
+/// trailer, so the sender never needs a digest pre-pass.
+const directTransferProtocolVersion = 2;
 const directTransferTokenHeader = 'X-Jet2Drop-Token';
+const directTransferProtocolVersionHeader = 'X-Jet2Drop-Protocol-Version';
+const directTransferFileLengthHeader = 'X-Jet2Drop-File-Length';
+
+/// Bytes of lower-case ASCII SHA-256 carried by the version 2 body trailer.
+const directTransferChecksumTrailerLength = 64;
+
+/// Historical protocol version 1 metadata header.  It is still used by the
+/// legacy `/v1/photo` compatibility route and is deliberately not sent by the
+/// version 2 generic sender, so an old receiver rejects the request instead of
+/// silently accepting a body whose length no longer matches the file.
 const directTransferSha256Header = 'X-Jet2Drop-SHA256';
 const _legacyPhotoTransferPath = '/v1/photo';
 
 typedef DirectTransferFileValidator =
     String? Function(String name, String? mimeType);
+
+/// Opens the byte range `[start, end)` of one source file for the streaming
+/// sender.  The default reads the file directly; tests replace it to observe
+/// that the HTTP body starts before the source has been read completely.
+typedef DirectTransferSourceOpener =
+    Stream<List<int>> Function(File source, int start, int end);
+
+/// Default [DirectTransferSourceOpener] used by the streaming sender.
+Stream<List<int>> directTransferFileOpener(File source, int start, int end) =>
+    source.openRead(start, end);
 
 /// A successful direct-transfer response.
 class DirectTransferReceipt {
@@ -141,6 +167,7 @@ class DirectTransferServer {
     this.allowEmptyFiles = true,
     this.requireExpectedSha256 = true,
     this.legacyPhotoCompatibility = false,
+    this.checksumTrailer = true,
   }) : _healthPath = healthPath ?? '$transferPath/health';
 
   final String token;
@@ -160,6 +187,13 @@ class DirectTransferServer {
   /// MIME validation and permits clients that predate the SHA-256 header. The
   /// generic [transferPath] route remains SHA-256 protected.
   final bool legacyPhotoCompatibility;
+
+  /// Accepts the protocol version 2 body for the generic route: the first
+  /// `X-Jet2Drop-File-Length` bytes are the file and the final 64 bytes are
+  /// the lower-case SHA-256 trailer.  [PhotoTransferServer] disables it so the
+  /// historical `/v1/photo` body and its optional digest header keep working
+  /// exactly as before.
+  final bool checksumTrailer;
   final String _healthPath;
 
   HttpServer? _server;
@@ -310,7 +344,57 @@ class DirectTransferServer {
       return;
     }
     final name = sanitizeTransferFileName(rawName);
-    final size = request.contentLength;
+
+    // Protocol version 2 declares the file length in a header and carries the
+    // digest in a fixed trailer, so the HTTP body length is never used as the
+    // file length.  Every rejection below happens before a target name is
+    // reserved and before any .part file is created.
+    final usesChecksumTrailer = checksumTrailer && !isLegacyPhotoRequest;
+    final int size;
+    if (usesChecksumTrailer) {
+      final protocolVersion = request.headers
+          .value(directTransferProtocolVersionHeader)
+          ?.trim();
+      if (protocolVersion == null || protocolVersion.isEmpty) {
+        await _respondError(
+          request.response,
+          HttpStatus.badRequest,
+          '直传请求缺少协议版本。',
+        );
+        return;
+      }
+      if (protocolVersion != '$directTransferProtocolVersion') {
+        await _respondError(
+          request.response,
+          HttpStatus.badRequest,
+          '直传协议版本不受支持。',
+        );
+        return;
+      }
+      final fileLength = _parseFileLengthHeader(
+        request.headers.value(directTransferFileLengthHeader),
+      );
+      if (fileLength == null) {
+        await _respondError(
+          request.response,
+          HttpStatus.badRequest,
+          '直传文件长度无效。',
+        );
+        return;
+      }
+      if (request.contentLength !=
+          fileLength + directTransferChecksumTrailerLength) {
+        await _respondError(
+          request.response,
+          HttpStatus.badRequest,
+          '直传请求长度与声明不符。',
+        );
+        return;
+      }
+      size = fileLength;
+    } else {
+      size = request.contentLength;
+    }
     final requestAllowsEmptyFiles = isLegacyPhotoRequest
         ? false
         : allowEmptyFiles;
@@ -340,21 +424,27 @@ class DirectTransferServer {
       return;
     }
 
-    final expectedSha256 = request.headers.value(directTransferSha256Header);
-    // /v1/direct must always carry a valid expected digest.  The option is
-    // retained for the historical PhotoTransferServer wrapper, whose primary
-    // route is /v1/photo rather than /v1/direct.
-    final requestRequiresExpectedSha256 = isLegacyPhotoRequest
-        ? false
-        : (request.uri.path == directTransferPath || requireExpectedSha256);
-    if ((requestRequiresExpectedSha256 && expectedSha256 == null) ||
-        (expectedSha256 != null && !_isSha256(expectedSha256))) {
-      await _respondError(
-        request.response,
-        HttpStatus.badRequest,
-        expectedSha256 == null ? '直传必须提供 SHA-256 元数据。' : '直传 SHA-256 元数据无效。',
-      );
-      return;
+    final expectedSha256 = usesChecksumTrailer
+        ? null
+        : request.headers.value(directTransferSha256Header);
+    // /v1/direct always carried a valid expected digest in protocol version 1.
+    // The option is retained for the historical PhotoTransferServer wrapper,
+    // whose primary route is /v1/photo rather than /v1/direct.  A version 2
+    // request carries its digest in the body trailer instead, so a legacy
+    // sender that omits the version header can never be mistaken for one.
+    if (!usesChecksumTrailer) {
+      final requestRequiresExpectedSha256 = isLegacyPhotoRequest
+          ? false
+          : (request.uri.path == directTransferPath || requireExpectedSha256);
+      if ((requestRequiresExpectedSha256 && expectedSha256 == null) ||
+          (expectedSha256 != null && !_isSha256(expectedSha256))) {
+        await _respondError(
+          request.response,
+          HttpStatus.badRequest,
+          expectedSha256 == null ? '直传必须提供 SHA-256 元数据。' : '直传 SHA-256 元数据无效。',
+        );
+        return;
+      }
     }
 
     File? partial;
@@ -374,15 +464,34 @@ class DirectTransferServer {
       partial = File('${target.path}.jet2drop-direct-${uniqueSuffix()}.part');
       final sink = partial.openWrite();
       final checksum = Sha256Accumulator();
-      var received = 0;
+      final trailer = <int>[];
+      var fileReceived = 0;
       try {
         await for (final chunk in request) {
-          received += chunk.length;
-          if (received > size) {
-            throw const DirectTransferException('直传数据超过声明大小。');
+          var offset = 0;
+          if (fileReceived < size) {
+            final remaining = size - fileReceived;
+            final take = chunk.length < remaining ? chunk.length : remaining;
+            final fileChunk = take == chunk.length
+                ? chunk
+                : chunk.sublist(0, take);
+            checksum.add(fileChunk);
+            sink.add(fileChunk);
+            fileReceived += take;
+            offset = take;
           }
-          checksum.add(chunk);
-          sink.add(chunk);
+          if (offset < chunk.length) {
+            // Everything after the declared file length belongs to the digest
+            // trailer and is never written into the .part file.
+            if (!usesChecksumTrailer) {
+              throw const DirectTransferException('直传数据超过声明大小。');
+            }
+            if (trailer.length + chunk.length - offset >
+                directTransferChecksumTrailerLength) {
+              throw const DirectTransferException('直传校验尾部长度无效。');
+            }
+            trailer.addAll(chunk.sublist(offset));
+          }
         }
         await sink.flush();
       } finally {
@@ -393,11 +502,22 @@ class DirectTransferServer {
         }
       }
 
-      if (received != size) {
+      if (fileReceived != size) {
         throw const DirectTransferException('直传未完整结束。');
       }
       final checksumValue = checksum.close();
-      if (expectedSha256 != null &&
+      if (usesChecksumTrailer) {
+        if (trailer.length != directTransferChecksumTrailerLength) {
+          throw const DirectTransferException('直传校验尾部缺失或不完整。');
+        }
+        final trailerValue = _decodeChecksumTrailer(trailer);
+        if (trailerValue == null) {
+          throw const DirectTransferException('直传校验尾部格式无效。');
+        }
+        if (trailerValue != checksumValue) {
+          throw const DirectTransferException('直传 SHA-256 校验失败，未保存。');
+        }
+      } else if (expectedSha256 != null &&
           checksumValue != expectedSha256.trim().toLowerCase()) {
         throw const DirectTransferException('直传 SHA-256 校验失败，未保存。');
       }
@@ -612,6 +732,8 @@ class DirectTransferClient {
     this.requestTimeout = const Duration(minutes: 30),
     this.transferPath = directTransferPath,
     this.includeExpectedSha256Header = true,
+    this.checksumTrailer = true,
+    this.sourceOpener = directTransferFileOpener,
     String? healthPath,
     HttpClient? httpClient,
   }) : _healthPath = healthPath ?? '$transferPath/health',
@@ -626,7 +748,20 @@ class DirectTransferClient {
   final Duration connectionTimeout;
   final Duration requestTimeout;
   final String transferPath;
+
+  /// Sends the historical `X-Jet2Drop-SHA256` request header.  It applies only
+  /// to the version 1 body format; the version 2 sender carries its digest in
+  /// the body trailer and never sends this header.
   final bool includeExpectedSha256Header;
+
+  /// Uses the protocol version 2 body: file bytes followed by the 64-byte
+  /// digest trailer.  [PhotoTransferClient] disables it to keep the legacy
+  /// `/v1/photo` request unchanged.
+  final bool checksumTrailer;
+
+  /// Test seam for the streamed source bytes.  Production callers keep the
+  /// default, which reads the requested byte range straight from the file.
+  final DirectTransferSourceOpener sourceOpener;
   final String _healthPath;
   final HttpClient _httpClient;
   final bool _ownsHttpClient;
@@ -634,11 +769,15 @@ class DirectTransferClient {
 
   String get healthPath => _healthPath;
 
-  /// Sends one file from the beginning.  [sha256] / [expectedSha256] can be
-  /// supplied by a caller that already streamed the file; otherwise the
-  /// client calculates the digest in a streaming pre-pass and sends it as
-  /// authenticated request metadata.  No pause, resume, or partial state is
-  /// retained.
+  /// Sends one file from the beginning.
+  ///
+  /// The version 2 sender computes the digest while it streams the file and
+  /// appends it to the same request body, so no digest pre-pass delays the
+  /// start of the transfer.  [sha256] / [expectedSha256] remain optional
+  /// caller-supplied metadata: when present their format is validated, both
+  /// values must agree, and the digest calculated during the send must match
+  /// or the request is aborted before the trailer is written.  No pause,
+  /// resume, or partial state is retained.
   Future<DirectTransferReceipt> send({
     required String endpoint,
     required String token,
@@ -662,9 +801,17 @@ class DirectTransferClient {
     if (control?.isCancelled == true) throw const TransferCancelled();
     final uri = _transferUri(endpoint, name);
     final suppliedSha256 = _resolveSha256(sha256, expectedSha256);
-    final expected = suppliedSha256 ?? await _hashSource(source, control);
-    if (!_isSha256(expected)) {
+    if (suppliedSha256 != null && !_isSha256(suppliedSha256)) {
       throw const DirectTransferException('直传 SHA-256 元数据无效。');
+    }
+    String? expected = suppliedSha256?.toLowerCase();
+    if (!checksumTrailer) {
+      // The legacy photo route keeps its digest pre-pass: its receiver
+      // validates the historical metadata header, not a body trailer.
+      expected ??= (await _hashSource(source, control)).toLowerCase();
+      if (!_isSha256(expected)) {
+        throw const DirectTransferException('直传 SHA-256 元数据无效。');
+      }
     }
     if (control?.isCancelled == true) throw const TransferCancelled();
 
@@ -683,26 +830,80 @@ class DirectTransferClient {
       }
       request.headers
         ..set(directTransferTokenHeader, token)
-        ..contentLength = size
         ..set(
           HttpHeaders.contentTypeHeader,
           mimeType == null || mimeType.trim().isEmpty
               ? 'application/octet-stream'
               : mimeType,
         );
-      if (includeExpectedSha256Header) {
-        request.headers.set(directTransferSha256Header, expected.toLowerCase());
-      }
-      await request
-          .addStream(
-            _sourceStream(source, control).map((chunk) {
-              if (control?.isCancelled == true) throw const TransferCancelled();
-              transferred += chunk.length;
-              onProgress?.call(transferred, size);
-              return chunk;
-            }),
+      final String sentDigest;
+      if (checksumTrailer) {
+        request.headers
+          ..set(
+            directTransferProtocolVersionHeader,
+            '$directTransferProtocolVersion',
           )
-          .timeout(requestTimeout);
+          ..set(directTransferFileLengthHeader, '$size')
+          ..contentLength = size + directTransferChecksumTrailerLength;
+        final checksum = Sha256Accumulator();
+        await request
+            .addStream(
+              sourceOpener(source, 0, size).map((chunk) {
+                if (control?.isCancelled == true) {
+                  throw const TransferCancelled();
+                }
+                transferred += chunk.length;
+                checksum.add(chunk);
+                onProgress?.call(transferred, size);
+                return chunk;
+              }),
+            )
+            .timeout(requestTimeout);
+        // Cancellation aborts the request, which can also end the body stream
+        // early.  Report that as a cancellation instead of a source change.
+        if (control?.isCancelled == true) throw const TransferCancelled();
+        if (transferred != size) {
+          // The file lost bytes while it was streamed.  Abort instead of
+          // letting the receiver publish a short file.
+          request.abort();
+          throw const DirectTransferException('直传源文件在发送期间发生变化，已中止。');
+        }
+        final currentLength = await source.length();
+        if (control?.isCancelled == true) throw const TransferCancelled();
+        if (currentLength != size) {
+          // The file grew behind the declared length.  The receiver would
+          // reject the extra bytes anyway; fail locally and cleanly.
+          request.abort();
+          throw const DirectTransferException('直传源文件在发送期间发生变化，已中止。');
+        }
+        final digest = checksum.close();
+        if (expected != null && digest != expected) {
+          request.abort();
+          throw const DirectTransferException('直传 SHA-256 校验失败，接收端未保存文件。');
+        }
+        sentDigest = digest;
+        // Exactly 64 lower-case ASCII characters, inside the same request and
+        // excluded from file progress.
+        request.add(utf8.encode(digest));
+      } else {
+        request.headers.contentLength = size;
+        if (includeExpectedSha256Header) {
+          request.headers.set(directTransferSha256Header, expected!);
+        }
+        sentDigest = expected!;
+        await request
+            .addStream(
+              _sourceStream(source, control).map((chunk) {
+                if (control?.isCancelled == true) {
+                  throw const TransferCancelled();
+                }
+                transferred += chunk.length;
+                onProgress?.call(transferred, size);
+                return chunk;
+              }),
+            )
+            .timeout(requestTimeout);
+      }
       final response = await request.close().timeout(requestTimeout);
       final body = await response.transform(utf8.decoder).join();
       final decoded = _decodeJson(body);
@@ -715,7 +916,7 @@ class DirectTransferClient {
       final receipt = DirectTransferReceipt.tryParse(decoded);
       if (receipt == null ||
           receipt.size != size ||
-          receipt.sha256 != expected.toLowerCase()) {
+          receipt.sha256 != sentDigest) {
         throw const DirectTransferException('直传校验失败，接收端未确认文件。');
       }
       onProgress?.call(size, size);
@@ -1044,6 +1245,35 @@ bool isTailscaleIpv4Address(InternetAddress address) {
 
 bool _isSha256(String value) =>
     RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(value.trim());
+
+/// Parses `X-Jet2Drop-File-Length`.
+///
+/// Only plain decimal digits are accepted: signs, whitespace padding, empty
+/// values and digit strings that could overflow a 64-bit integer are rejected
+/// before any arithmetic is performed.
+int? _parseFileLengthHeader(String? value) {
+  if (value == null) return null;
+  final trimmed = value.trim();
+  if (trimmed.isEmpty || trimmed.length > 19) return null;
+  for (final unit in trimmed.codeUnits) {
+    if (unit < 0x30 || unit > 0x39) return null;
+  }
+  return int.tryParse(trimmed);
+}
+
+/// Decodes the fixed body trailer, accepting only lower-case hexadecimal
+/// ASCII.  Anything else is a malformed digest rather than a checksum
+/// mismatch.
+String? _decodeChecksumTrailer(List<int> trailer) {
+  final buffer = StringBuffer();
+  for (final byte in trailer) {
+    final isDigit = byte >= 0x30 && byte <= 0x39;
+    final isLowerHex = byte >= 0x61 && byte <= 0x66;
+    if (!isDigit && !isLowerHex) return null;
+    buffer.writeCharCode(byte);
+  }
+  return buffer.toString();
+}
 
 /// Validates the historical photo-only endpoint without importing the
 /// compatibility wrapper (which itself imports this library).  The generic
