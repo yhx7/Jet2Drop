@@ -253,11 +253,12 @@ class AppDelegate: FlutterAppDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     statusItem = item
     if let button = item.button {
-      let image = (NSApp.applicationIconImage.copy() as? NSImage) ?? NSImage(
+      let image = NSImage(named: "StatusBarIcon") ?? NSImage(
         systemSymbolName: "arrow.left.arrow.right",
         accessibilityDescription: "Jet2Drop"
       )!
       image.size = NSSize(width: 18, height: 18)
+      image.isTemplate = true
       button.image = image
       button.toolTip = "Jet2Drop"
       button.target = self
