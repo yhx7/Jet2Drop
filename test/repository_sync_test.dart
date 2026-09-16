@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jet2drop/core/models/file_entry.dart';
 import 'package:jet2drop/core/repository_gateway.dart';
@@ -50,6 +51,220 @@ void main() {
         (await engine.inspect()).local.keys,
         isNot(contains('.jet2drop_sync')),
       );
+    },
+  );
+
+  test(
+    'macOS hidden metadata does not create a phantom local change',
+    () async {
+      await File('${remote.path}/a.txt').writeAsString('remote');
+      expect((await engine.pull()).applied, isTrue);
+      await File('${local.path}/.DS_Store').writeAsString('Finder metadata');
+      await Directory('${local.path}/.hidden').create();
+      await File('${local.path}/.hidden/metadata').writeAsString('hidden');
+
+      expect((await engine.inspect()).status, RepositorySyncStatus.synced);
+      expect((await engine.pull()).changedPaths, isEmpty);
+    },
+  );
+
+  test('sync progress reports real transfer and apply phases', () async {
+    await File('${remote.path}/a.bin').writeAsBytes(List<int>.filled(4097, 7));
+    await File('${remote.path}/b.bin').writeAsBytes([1, 2, 3]);
+    final events = <RepositorySyncProgress>[];
+    engine = RepositorySyncEngine(
+      localRoot: local,
+      remote: LocalRepositoryGateway(remote.path),
+      ownerId: 'progress-owner',
+      trustRemoteManifest: false,
+      onProgress: events.add,
+    );
+    await engine.remote.initialize();
+
+    final pulled = await engine.pull();
+    expect(pulled.applied, isTrue);
+    expect(
+      events.any(
+        (event) => event.phase == RepositorySyncProgressPhase.checking,
+      ),
+      isTrue,
+    );
+    final pullTransfers = events
+        .where(
+          (event) =>
+              event.direction == RepositorySyncDirection.pull &&
+              event.phase == RepositorySyncProgressPhase.transferring,
+        )
+        .toList();
+    expect(pullTransfers, isNotEmpty);
+    final completedPull = pullTransfers.last;
+    expect(completedPull.completedFiles, 2);
+    expect(completedPull.totalFiles, 2);
+    expect(completedPull.transferredBytes, 4100);
+    expect(completedPull.totalBytes, 4100);
+    expect(completedPull.fraction, 1);
+    final checking = events.firstWhere(
+      (event) => event.phase == RepositorySyncProgressPhase.checking,
+    );
+    expect(checking.fraction, isNull);
+    final applying = events.lastWhere(
+      (event) => event.phase == RepositorySyncProgressPhase.applying,
+    );
+    expect(applying.fraction, isNull);
+
+    await File('${local.path}/pushed.bin').writeAsBytes([4, 5, 6, 7]);
+    final pushed = await engine.push();
+    expect(pushed.applied, isTrue);
+    final pushTransfers = events
+        .where(
+          (event) =>
+              event.direction == RepositorySyncDirection.push &&
+              event.phase == RepositorySyncProgressPhase.transferring,
+        )
+        .toList();
+    expect(pushTransfers.last.completedFiles, 1);
+    expect(pushTransfers.last.totalFiles, 1);
+    expect(pushTransfers.last.transferredBytes, 4);
+    expect(pushTransfers.last.totalBytes, 4);
+  });
+
+  test('transfer progress stays below 100% until every file completes', () {
+    const almostDone = RepositorySyncProgress(
+      phase: RepositorySyncProgressPhase.transferring,
+      transferredBytes: 999,
+      totalBytes: 1000,
+      completedFiles: 734,
+      totalFiles: 735,
+    );
+    expect(almostDone.fraction, lessThan(1));
+    expect(almostDone.fraction, 0.99);
+    const done = RepositorySyncProgress(
+      phase: RepositorySyncProgressPhase.transferring,
+      transferredBytes: 1000,
+      totalBytes: 1000,
+      completedFiles: 735,
+      totalFiles: 735,
+    );
+    expect(done.fraction, 1);
+  });
+
+  test('fallback SHA-256 reads expose verification progress', () async {
+    await File(
+      '${remote.path}/checksum.bin',
+    ).writeAsBytes(List<int>.filled(2048, 9));
+    final checksumlessRemote = _ChecksumlessDownloadGateway(remote.path);
+    final events = <RepositorySyncProgress>[];
+    engine = RepositorySyncEngine(
+      localRoot: local,
+      remote: checksumlessRemote,
+      ownerId: 'checksum-progress-owner',
+      trustRemoteManifest: false,
+      onProgress: events.add,
+    );
+    await checksumlessRemote.initialize();
+
+    expect((await engine.pull()).applied, isTrue);
+    final verification = events.where(
+      (event) => event.phase == RepositorySyncProgressPhase.verifying,
+    );
+    expect(verification, isNotEmpty);
+    expect(verification.last.currentPath, 'checksum.bin');
+    expect(verification.last.transferredBytes, 2048);
+    expect(verification.last.totalBytes, 2048);
+  });
+
+  test(
+    'a truncated download is rejected before updating the baseline',
+    () async {
+      await File('${remote.path}/a.txt').writeAsString('complete payload');
+      final truncatingRemote = _TruncatingDownloadGateway(remote.path);
+      engine = RepositorySyncEngine(
+        localRoot: local,
+        remote: truncatingRemote,
+        ownerId: 'truncating-owner',
+        trustRemoteManifest: false,
+      );
+      await truncatingRemote.initialize();
+
+      await expectLater(
+        engine.pull(),
+        throwsA(
+          isA<RepositorySyncException>().having(
+            (error) => error.message,
+            'message',
+            contains('大小校验失败'),
+          ),
+        ),
+      );
+      expect(await File('${local.path}/a.txt').exists(), isFalse);
+      expect(
+        await File('${local.path}/.jet2drop_sync/baseline.json').exists(),
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'pull repairs only a legacy truncated copy recorded in baseline',
+    () async {
+      final remoteFile = File('${remote.path}/a.bin');
+      await remoteFile.writeAsBytes(List<int>.generate(100001, (i) => i % 251));
+      expect((await engine.pull()).applied, isTrue);
+
+      final localFile = File('${local.path}/a.bin');
+      final partial = (await localFile.readAsBytes()).take(50000).toList();
+      await localFile.writeAsBytes(partial);
+      final truncatedHash = sha256.convert(partial).toString();
+      final baselineFile = File('${local.path}/.jet2drop_sync/baseline.json');
+      final baseline = RepositorySyncManifest.decode(
+        await baselineFile.readAsString(),
+      );
+      final baselineEntries = Map<String, RepositorySyncEntry>.from(
+        baseline.entries,
+      );
+      baselineEntries['a.bin'] = baselineEntries['a.bin']!.copyWith(
+        sha256: truncatedHash,
+      );
+      await baselineFile.writeAsString(
+        RepositorySyncManifest(
+          revision: baseline.revision,
+          createdAt: baseline.createdAt,
+          entries: baselineEntries,
+        ).encode(),
+      );
+      final manifestFile = File('${remote.path}/__jet2drop_sync/manifest.json');
+      final manifest = RepositorySyncManifest.decode(
+        await manifestFile.readAsString(),
+      );
+      final remoteEntries = Map<String, RepositorySyncEntry>.from(
+        manifest.entries,
+      );
+      remoteEntries['a.bin'] = remoteEntries['a.bin']!.copyWith(
+        sha256: truncatedHash,
+      );
+      await manifestFile.writeAsString(
+        RepositorySyncManifest(
+          revision: manifest.revision,
+          createdAt: manifest.createdAt,
+          entries: remoteEntries,
+        ).encode(),
+      );
+
+      final repaired = RepositorySyncEngine(
+        localRoot: local,
+        remote: LocalRepositoryGateway(remote.path),
+        trustRemoteManifest: true,
+      );
+      await repaired.remote.initialize();
+      expect((await repaired.inspect()).status, RepositorySyncStatus.changed);
+      final edited = List<int>.from(partial)..[0] ^= 1;
+      await localFile.writeAsBytes(edited);
+      expect((await repaired.pull()).applied, isFalse);
+      expect(await localFile.readAsBytes(), edited);
+      await localFile.writeAsBytes(partial);
+      expect((await repaired.pull()).applied, isTrue);
+      expect(await localFile.readAsBytes(), await remoteFile.readAsBytes());
+      expect((await repaired.inspect()).status, RepositorySyncStatus.synced);
     },
   );
 
@@ -345,6 +560,51 @@ class _FailingMoveGateway extends LocalRepositoryGateway {
     }
     return super.moveEntry(sourcePath, targetPath, overwrite: overwrite);
   }
+}
+
+class _TruncatingDownloadGateway extends LocalRepositoryGateway {
+  _TruncatingDownloadGateway(super.rootPath);
+
+  @override
+  Future<void> downloadFile({
+    required String remotePath,
+    required File target,
+    String? resumeId,
+    ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
+    TransferControl? control,
+  }) async {
+    await super.downloadFile(
+      remotePath: remotePath,
+      target: target,
+      resumeId: resumeId,
+      onProgress: onProgress,
+      onChecksum: onChecksum,
+      control: control,
+    );
+    final bytes = await target.readAsBytes();
+    await target.writeAsBytes(bytes.take(bytes.length ~/ 2).toList());
+  }
+}
+
+class _ChecksumlessDownloadGateway extends LocalRepositoryGateway {
+  _ChecksumlessDownloadGateway(super.rootPath);
+
+  @override
+  Future<void> downloadFile({
+    required String remotePath,
+    required File target,
+    String? resumeId,
+    ProgressCallback? onProgress,
+    ChecksumCallback? onChecksum,
+    TransferControl? control,
+  }) => super.downloadFile(
+    remotePath: remotePath,
+    target: target,
+    resumeId: resumeId,
+    onProgress: onProgress,
+    control: control,
+  );
 }
 
 class _CompetingGateway extends LocalRepositoryGateway {

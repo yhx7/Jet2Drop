@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:jet2drop/app_controller.dart';
 import 'package:jet2drop/core/models/quick_device.dart';
 import 'package:jet2drop/core/models/transfer_task.dart';
+import 'package:jet2drop/core/repository_sync.dart';
 import 'package:jet2drop/main.dart';
 
 void main() {
@@ -250,7 +251,7 @@ void main() {
         find.byIcon(Icons.arrow_upward),
       );
       final compactSort = tester.getCenter(find.byIcon(Icons.sort));
-      expect(compactUpload.dy, lessThan(compactBack.dy));
+      expect(compactUpload.dy, greaterThan(compactBack.dy));
       expect(compactBack.dy, closeTo(compactRefresh.dy, 2));
       expect(compactDirection.dy, closeTo(compactSort.dy, 2));
       expect(compactDirection.dx, greaterThan(compactRefresh.dx));
@@ -266,6 +267,97 @@ void main() {
       expect(direction.dx, lessThan(sort.dx));
     },
   );
+
+  testWidgets('repository sync progress renders in the status area', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = false
+      ..isReady = true
+      ..mode = RepositoryMode.macSync
+      ..syncStatus = RepositorySyncStatus.syncing
+      ..syncStatusMessage = '正在拉取更新…'
+      ..syncProgress = const RepositorySyncProgress(
+        phase: RepositorySyncProgressPhase.transferring,
+        direction: RepositorySyncDirection.pull,
+        transferredBytes: 512,
+        totalBytes: 1024,
+        completedFiles: 1,
+        totalFiles: 2,
+        currentPath: 'folder/photo.jpg',
+      );
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(home: RepositoryPage(controller: controller)),
+    );
+
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+    expect(find.textContaining('1/2 个文件'), findsOneWidget);
+    expect(find.textContaining('512 B/1.00 KB'), findsOneWidget);
+    expect(find.textContaining('folder/photo.jpg'), findsOneWidget);
+    expect(
+      tester.getCenter(find.byType(LinearProgressIndicator)).dy,
+      closeTo(tester.getCenter(find.text('同步中')).dy, 3),
+    );
+  });
+
+  testWidgets('verification uses a steady spinner without per-file progress', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = false
+      ..isReady = true
+      ..mode = RepositoryMode.macSync
+      ..syncStatus = RepositorySyncStatus.syncing
+      ..syncProgress = const RepositorySyncProgress(
+        phase: RepositorySyncProgressPhase.verifying,
+        transferredBytes: 512,
+        totalBytes: 1024,
+        completedFiles: 0,
+        totalFiles: 1,
+        currentPath: 'folder/file.pdf',
+      );
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(home: RepositoryPage(controller: controller)),
+    );
+
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsNothing);
+    expect(find.text('正在校验文件…'), findsOneWidget);
+    expect(find.textContaining('folder/file.pdf'), findsNothing);
+    expect(find.textContaining('0/1 个文件'), findsNothing);
+  });
+
+  testWidgets('repository sync conflicts remain visible below the status', (
+    tester,
+  ) async {
+    final controller = AppController()
+      ..isInitializing = false
+      ..isReady = true
+      ..mode = RepositoryMode.macSync
+      ..syncStatus = RepositorySyncStatus.needsAttention
+      ..syncStatusMessage = '发现冲突'
+      ..syncConflicts = const [
+        RepositorySyncConflict(
+          path: 'notes.txt',
+          type: RepositorySyncConflictType.modifiedModified,
+          local: null,
+          remote: null,
+          baseline: null,
+        ),
+      ];
+    addTearDown(controller.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(home: RepositoryPage(controller: controller)),
+    );
+
+    expect(find.text('冲突 1 项'), findsOneWidget);
+    expect(find.text('notes.txt：本地和远端都已修改'), findsOneWidget);
+  });
 
   testWidgets(
     'same-name warning is absent until an upload actually conflicts',

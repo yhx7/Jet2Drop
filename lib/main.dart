@@ -258,7 +258,6 @@ class _RepositoryPageState extends State<RepositoryPage>
     return Column(
       children: [
         _responsiveToolbar(),
-        if (controller.isMacRepositoryMirror) _syncToolbar(),
         _breadcrumbs(),
         if (controller.error != null)
           MaterialBanner(
@@ -453,27 +452,93 @@ class _RepositoryPageState extends State<RepositoryPage>
           ),
         ],
       );
+      final syncActions = controller.isMacRepositoryMirror
+          ? _syncActionButtons()
+          : const SizedBox.shrink();
       return Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
         child: compact
             ? Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Center(child: fileActions),
-                  const SizedBox(height: 8),
                   Row(children: [navigation, const Spacer(), sorting]),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 8,
+                    runSpacing: 4,
+                    children: [syncActions, fileActions],
+                  ),
+                  if (controller.isMacRepositoryMirror) ...[
+                    const SizedBox(height: 8),
+                    _syncStatusLine(),
+                  ],
                 ],
               )
-            : Row(children: [navigation, sorting, const Spacer(), fileActions]),
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      navigation,
+                      sorting,
+                      const Spacer(),
+                      syncActions,
+                      if (controller.isMacRepositoryMirror)
+                        const SizedBox(width: 8),
+                      fileActions,
+                    ],
+                  ),
+                  if (controller.isMacRepositoryMirror) ...[
+                    const SizedBox(height: 8),
+                    _syncStatusLine(),
+                  ],
+                ],
+              ),
       );
     },
   );
 
-  Widget _syncToolbar() {
+  Widget _syncActionButtons() {
     final busy =
         controller.syncStatus == RepositorySyncStatus.syncing ||
         controller.isLoading ||
         controller.hasActiveTransfers;
+    return Wrap(
+      spacing: 8,
+      runSpacing: 4,
+      children: [
+        OutlinedButton.icon(
+          onPressed: busy
+              ? null
+              : () async {
+                  try {
+                    await controller.pullRepositoryUpdates();
+                  } catch (exception) {
+                    if (mounted) _message(controller.describeError(exception));
+                  }
+                },
+          icon: const Icon(Icons.download_outlined),
+          label: const Text('拉取更新'),
+        ),
+        FilledButton.icon(
+          onPressed: busy
+              ? null
+              : () async {
+                  try {
+                    await controller.pushRepositoryUpdates();
+                  } catch (exception) {
+                    if (mounted) _message(controller.describeError(exception));
+                  }
+                },
+          icon: const Icon(Icons.upload_outlined),
+          label: const Text('推送更新'),
+        ),
+      ],
+    );
+  }
+
+  Widget _syncStatusLine() {
     final status = switch (controller.syncStatus) {
       RepositorySyncStatus.synced => ('已同步', Colors.green, Icons.cloud_done),
       RepositorySyncStatus.changed => (
@@ -492,72 +557,113 @@ class _RepositoryPageState extends State<RepositoryPage>
         Icons.warning_amber_outlined,
       ),
     };
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-      child: Wrap(
-        crossAxisAlignment: WrapCrossAlignment.center,
-        spacing: 8,
-        runSpacing: 6,
-        children: [
-          Icon(status.$3, size: 18, color: status.$2),
-          Text(status.$1, style: TextStyle(color: status.$2)),
+    final progress = controller.syncProgress;
+    final isTransferring =
+        progress?.phase == RepositorySyncProgressPhase.transferring;
+    final showSpinner =
+        controller.syncStatus == RepositorySyncStatus.syncing &&
+        !isTransferring;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Tooltip(
+              message: controller.syncStatusMessage,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(status.$3, size: 18, color: status.$2),
+                  const SizedBox(width: 5),
+                  Text(status.$1, style: TextStyle(color: status.$2)),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            if (isTransferring) ...[
+              SizedBox(
+                width: 160,
+                child: LinearProgressIndicator(value: progress!.fraction),
+              ),
+              const SizedBox(width: 8),
+            ] else if (showSpinner) ...[
+              const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 8),
+            ],
+            Expanded(
+              child: Text(
+                progress == null
+                    ? controller.syncStatusMessage
+                    : _syncProgressMessage(progress),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        if (controller.syncConflicts.isNotEmpty) ...[
+          const SizedBox(height: 4),
           Text(
-            controller.syncStatusMessage,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
+            '冲突 ${controller.syncConflicts.length} 项',
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
           ),
-          const SizedBox(width: 4),
-          OutlinedButton.icon(
-            onPressed: busy
-                ? null
-                : () async {
-                    try {
-                      await controller.pullRepositoryUpdates();
-                    } catch (exception) {
-                      if (mounted) {
-                        _message(controller.describeError(exception));
-                      }
-                    }
-                  },
-            icon: const Icon(Icons.download_outlined),
-            label: const Text('拉取更新'),
-          ),
-          FilledButton.icon(
-            onPressed: busy
-                ? null
-                : () async {
-                    try {
-                      await controller.pushRepositoryUpdates();
-                    } catch (exception) {
-                      if (mounted) {
-                        _message(controller.describeError(exception));
-                      }
-                    }
-                  },
-            icon: const Icon(Icons.upload_outlined),
-            label: const Text('推送更新'),
-          ),
-          if (controller.syncConflicts.isNotEmpty)
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '冲突 ${controller.syncConflicts.length} 项',
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-                for (final conflict in controller.syncConflicts.take(4))
-                  Text(
-                    '${conflict.path}：${conflict.description}',
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                      fontSize: 12,
-                    ),
-                  ),
-              ],
+          for (final conflict in controller.syncConflicts.take(4))
+            Text(
+              '${conflict.path}：${conflict.description}',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.error,
+                fontSize: 12,
+              ),
             ),
         ],
-      ),
+      ],
     );
+  }
+
+  String _syncProgressMessage(RepositorySyncProgress progress) {
+    final direction = progress.direction == RepositorySyncDirection.push
+        ? '推送'
+        : '拉取';
+    final current = progress.currentPath?.isNotEmpty == true
+        ? progress.currentPath!
+        : '准备中';
+    return switch (progress.phase) {
+      RepositorySyncProgressPhase.checking => '正在检查仓库…',
+      RepositorySyncProgressPhase.applying => '正在应用同步…',
+      RepositorySyncProgressPhase.transferring =>
+        '$direction ${_syncPercent(progress)} · '
+            '${progress.completedFiles}/${progress.totalFiles} 个文件 · '
+            '${_formatSyncBytes(progress.transferredBytes)}/'
+            '${_formatSyncBytes(progress.totalBytes)} · $current',
+      RepositorySyncProgressPhase.verifying => '正在校验文件…',
+    };
+  }
+
+  String _syncPercent(RepositorySyncProgress progress) {
+    final fraction = progress.fraction;
+    if (fraction == null) return '计算中';
+    return '${(fraction * 100).floor()}%';
+  }
+
+  String _formatSyncBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var value = bytes.toDouble();
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    final decimals = value >= 100
+        ? 0
+        : value >= 10
+        ? 1
+        : 2;
+    return '${value.toStringAsFixed(decimals)} ${units[unit]}';
   }
 
   Widget _breadcrumbs() {
@@ -572,7 +678,7 @@ class _RepositoryPageState extends State<RepositoryPage>
           const SizedBox(width: 6),
           Text(
             controller.isMacRepositoryMirror
-                ? 'Mac 本地副本'
+                ? '副本仓库'
                 : controller.mode == RepositoryMode.local
                 ? 'Repository'
                 : '远程仓库',
@@ -1775,7 +1881,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                       if (Platform.isMacOS)
                         const ButtonSegment(
                           value: RepositoryMode.macSync,
-                          label: Text('Mac 本地副本'),
+                          label: Text('副本仓库'),
                         ),
                       const ButtonSegment(
                         value: RepositoryMode.sftp,
@@ -1799,7 +1905,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                     TextField(
                       controller: local,
                       decoration: const InputDecoration(
-                        labelText: '本地副本目录',
+                        labelText: '副本仓库目录',
                         hintText: '选择一个用于离线浏览和修改的文件夹',
                       ),
                     ),
@@ -1814,7 +1920,7 @@ class _RepositoryPageState extends State<RepositoryPage>
                           }
                         },
                         icon: const Icon(Icons.folder_open_outlined),
-                        label: const Text('选择本地副本目录'),
+                        label: const Text('选择副本仓库目录'),
                       ),
                     ),
                     const SizedBox(height: 8),

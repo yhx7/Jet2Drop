@@ -125,8 +125,9 @@ class AppController extends ChangeNotifier {
   String currentPath = '';
   String? error;
   RepositorySyncStatus syncStatus = RepositorySyncStatus.synced;
-  String syncStatusMessage = '尚未配置本地副本';
+  String syncStatusMessage = '尚未配置副本仓库';
   List<RepositorySyncConflict> syncConflicts = const [];
+  RepositorySyncProgress? syncProgress;
   List<FileEntry> entries = const [];
   final List<TransferTask> tasks = [];
   final Map<String, TransferControl> _transferControls = {};
@@ -162,6 +163,7 @@ class AppController extends ChangeNotifier {
   bool _quickRefreshDevicesPending = false;
   bool _quickMutationInProgress = false;
   bool _disposed = false;
+  DateTime? _lastSyncProgressNotification;
   Completer<void>? _quickRefreshIdle;
   Future<void> _quickMutationTail = Future<void>.value();
   Future<void>? _quickInitializationFuture;
@@ -918,13 +920,13 @@ class AppController extends ChangeNotifier {
     required SftpConnectionProfile profile,
   }) async {
     if (!Platform.isMacOS) {
-      throw StateError('本地副本同步只支持 macOS。');
+      throw StateError('副本仓库同步只支持 macOS。');
     }
     if (hasActiveTransfers) {
       throw StateError('Wait for active transfers before changing connection.');
     }
     final clean = path.trim();
-    if (clean.isEmpty) throw ArgumentError('请选择 Mac 本地副本目录。');
+    if (clean.isEmpty) throw ArgumentError('请选择副本仓库目录。');
     await Directory(clean).create(recursive: true);
     final localCandidate = LocalRepositoryGateway(clean);
     final support = await getApplicationSupportDirectory();
@@ -977,7 +979,12 @@ class AppController extends ChangeNotifier {
       _syncEngine = RepositorySyncEngine(
         localRoot: Directory(localPath),
         remote: remoteCandidate,
+        onProgress: _handleSyncProgress,
       );
+      syncStatus = RepositorySyncStatus.syncing;
+      syncStatusMessage = '正在检查仓库…';
+      syncConflicts = const [];
+      _clearSyncProgress();
       _invalidateQuickState();
       currentPath = '';
       entries = candidateEntries;
@@ -1083,7 +1090,7 @@ class AppController extends ChangeNotifier {
         _gateway = LocalRepositoryGateway(localRoot);
       } else if (mode == RepositoryMode.macSync) {
         if (!Platform.isMacOS || localRoot.trim().isEmpty) {
-          throw StateError('请先选择 Mac 本地副本目录。');
+          throw StateError('请先选择副本仓库目录。');
         }
         final profile = sftpProfile;
         if (profile == null) {
@@ -1100,7 +1107,12 @@ class AppController extends ChangeNotifier {
         _syncEngine = RepositorySyncEngine(
           localRoot: Directory(localRoot),
           remote: _syncGateway!,
+          onProgress: _handleSyncProgress,
         );
+        syncStatus = RepositorySyncStatus.syncing;
+        syncStatusMessage = '正在检查仓库…';
+        syncConflicts = const [];
+        _clearSyncProgress();
       } else {
         final profile = sftpProfile;
         if (profile == null) {
@@ -1339,18 +1351,49 @@ class AppController extends ChangeNotifier {
   Future<void> _refreshSyncSnapshot() async {
     final engine = _syncEngine;
     if (engine == null || mode != RepositoryMode.macSync) return;
+    _clearSyncProgress();
     try {
       final snapshot = await engine.inspect();
       syncStatus = snapshot.status;
       syncStatusMessage = snapshot.message;
       syncConflicts = snapshot.conflicts;
+      _clearSyncProgress();
       notifyListeners();
     } catch (exception) {
       syncStatus = RepositorySyncStatus.needsAttention;
       syncStatusMessage = describeError(exception);
       syncConflicts = const [];
+      _clearSyncProgress();
       notifyListeners();
     }
+  }
+
+  void _handleSyncProgress(RepositorySyncProgress progress) {
+    if (_disposed || mode != RepositoryMode.macSync) return;
+    final previous = syncProgress;
+    syncProgress = progress;
+    final now = DateTime.now();
+    final phaseChanged = previous?.phase != progress.phase;
+    final fileChanged = previous?.currentPath != progress.currentPath;
+    final countChanged = previous?.completedFiles != progress.completedFiles;
+    final elapsed = _lastSyncProgressNotification == null
+        ? const Duration(days: 1)
+        : now.difference(_lastSyncProgressNotification!);
+    // SFTP can report one callback per 32 KB chunk. Keep the UI responsive by
+    // coalescing byte-only updates while still publishing phase/file changes
+    // immediately and never hiding the final state of a file.
+    if (phaseChanged ||
+        fileChanged ||
+        countChanged ||
+        elapsed >= const Duration(milliseconds: 50)) {
+      _lastSyncProgressNotification = now;
+      notifyListeners();
+    }
+  }
+
+  void _clearSyncProgress() {
+    syncProgress = null;
+    _lastSyncProgressNotification = null;
   }
 
   Future<RepositorySyncResult?> pullRepositoryUpdates() =>
@@ -1364,7 +1407,7 @@ class AppController extends ChangeNotifier {
   ) async {
     final engine = _syncEngine;
     if (mode != RepositoryMode.macSync || engine == null) {
-      throw StateError('请先配置 Mac 本地副本。');
+      throw StateError('请先配置副本仓库。');
     }
     if (hasActiveTransfers || isLoading) {
       throw StateError('有其他任务正在运行，请稍后再同步。');
@@ -1377,6 +1420,7 @@ class AppController extends ChangeNotifier {
         ? '正在拉取更新…'
         : '正在推送更新…';
     syncConflicts = const [];
+    _clearSyncProgress();
     notifyListeners();
     try {
       final result = direction == RepositorySyncDirection.pull
@@ -1385,6 +1429,7 @@ class AppController extends ChangeNotifier {
       syncStatus = result.snapshot.status;
       syncStatusMessage = result.snapshot.message;
       syncConflicts = result.conflicts;
+      _clearSyncProgress();
       if (result.applied) {
         entries = await _gateway!.listDirectory(currentPath);
       }
@@ -1396,6 +1441,7 @@ class AppController extends ChangeNotifier {
       syncConflicts = exception is RepositorySyncException
           ? exception.conflicts
           : const [];
+      _clearSyncProgress();
       notifyListeners();
       rethrow;
     }
@@ -2132,7 +2178,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> createDirectory(String name) async {
     if (isSyncInProgress) {
-      throw StateError('同步进行中，请完成后再修改本地副本。');
+      throw StateError('同步进行中，请完成后再修改副本仓库。');
     }
     final safeName = sanitizeTransferFileName(name);
     if (entries.any(
@@ -2149,7 +2195,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> deleteEntry(FileEntry entry) async {
     if (isSyncInProgress) {
-      throw StateError('同步进行中，请完成后再修改本地副本。');
+      throw StateError('同步进行中，请完成后再修改副本仓库。');
     }
     await _retryOperation(
       () => _gateway!.deleteEntry(entry.path, recursive: entry.isDirectory),
@@ -2164,7 +2210,7 @@ class AppController extends ChangeNotifier {
     bool keepBoth = false,
   }) async {
     if (isSyncInProgress) {
-      throw StateError('同步进行中，请完成后再修改本地副本。');
+      throw StateError('同步进行中，请完成后再修改副本仓库。');
     }
     await validateTransferSelection(files);
     final reservedNames = entries
@@ -3749,7 +3795,7 @@ class AppController extends ChangeNotifier {
   Future<void> _invalidateCentralSyncManifest() async {
     if (mode == RepositoryMode.macSync) {
       syncStatus = RepositorySyncStatus.changed;
-      syncStatusMessage = '本地副本有尚未推送的变更';
+      syncStatusMessage = '副本仓库有尚未推送的变更';
       syncConflicts = const [];
       notifyListeners();
       return;

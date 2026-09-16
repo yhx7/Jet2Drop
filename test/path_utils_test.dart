@@ -114,6 +114,17 @@ void main() {
     expect(() => gateway.listDirectory('../outside'), throwsArgumentError);
   });
 
+  test('dot-prefixed local entries are hidden only on macOS', () async {
+    final root = await Directory.systemTemp.createTemp('jet2drop-hidden-');
+    addTearDown(() => root.delete(recursive: true));
+    await File('${root.path}/.user-data').writeAsString('test');
+    final gateway = LocalRepositoryGateway(root.path);
+    await gateway.initialize();
+
+    final names = (await gateway.listDirectory('')).map((entry) => entry.name);
+    expect(names.contains('.user-data'), !Platform.isMacOS);
+  });
+
   test('resumed download checksum covers the bytes already on disk', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-resume-hash-');
     addTearDown(() => root.delete(recursive: true));

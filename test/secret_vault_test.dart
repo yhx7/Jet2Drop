@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:jet2drop/infrastructure/secret_vault.dart';
 
 class _MemoryBackend implements SecretVaultBackend {
@@ -21,7 +24,66 @@ class _MemoryBackend implements SecretVaultBackend {
   }
 }
 
+class _MemorySecureStorage extends FlutterSecureStorage {
+  _MemorySecureStorage(this.value);
+
+  String? value;
+  int reads = 0;
+  int writes = 0;
+
+  @override
+  Future<String?> read({
+    required String key,
+    AppleOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    AppleOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async {
+    reads++;
+    return value;
+  }
+
+  @override
+  Future<void> write({
+    required String key,
+    required String? value,
+    AppleOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    AppleOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async {
+    writes++;
+    this.value = value;
+  }
+}
+
 void main() {
+  test('macOS keychain migration preserves old and newer secrets', () async {
+    if (!Platform.isMacOS) return;
+    final current = _MemorySecureStorage('{"direct-token":"new"}');
+    final legacy = _MemorySecureStorage(
+      '{"direct-token":"old","sftp_password":"saved"}',
+    );
+    final backend = FlutterSecureSecretVaultBackend(
+      storage: current,
+      legacyStorage: legacy,
+    );
+
+    final vault = Jet2DropSecretVault(backend: backend);
+    expect(await vault.read('sftp_password'), 'saved');
+    expect(await vault.read('direct-token'), 'new');
+    expect(legacy.reads, 1);
+    expect(current.writes, 1);
+
+    final reopened = Jet2DropSecretVault(backend: backend);
+    expect(await reopened.read('sftp_password'), 'saved');
+    expect(legacy.reads, 1);
+  });
+
   test('all secrets share one cached backend item', () async {
     final backend = _MemoryBackend();
     final vault = Jet2DropSecretVault(backend: backend);

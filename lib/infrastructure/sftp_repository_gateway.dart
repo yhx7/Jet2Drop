@@ -39,21 +39,43 @@ class SftpRepositoryGateway
   SSHClient? _client;
   SftpClient? _sftp;
 
-  static const _operationTimeout = Duration(seconds: 45);
+  // Relay paths can pause for close to a minute even while the connection is
+  // healthy. This is an inactivity guard, not a total-transfer deadline.
+  static const _operationTimeout = Duration(minutes: 2);
   // SFTP's default 16 KiB reads turn a high-latency relay into thousands of
   // tiny round trips. dartssh2 recommends this 64 KiB/128-request pipeline
   // for high-latency links. The library still yields chunks in file order, so
   // pause/cancel/checksum/atomic-publish semantics remain unchanged.
-  static const _downloadChunkSize = 64 * 1024;
+  // SFTPGo may legally return fewer bytes than requested. dartssh2's ordered
+  // read stream advances queued offsets by the requested size, so requesting
+  // 64 KiB from a server capped at 32 KiB can skip every other 32 KiB block.
+  // Match the widely supported SFTP packet size while retaining a 4 MiB
+  // in-flight window through the request pipeline.
+  static const _downloadChunkSize = 32 * 1024;
   static const _downloadPendingRequests = 128;
 
   Future<T> _withOperationTimeout<T>(Future<T> operation, String action) =>
       operation.timeout(
         _operationTimeout,
-        onTimeout: () => throw TimeoutException(
-          '$action timed out after ${_operationTimeout.inSeconds} seconds.',
-        ),
+        onTimeout: () {
+          // Future.timeout does not cancel the original SFTP request. Leaving
+          // it alive makes the UI report a failure while that request keeps
+          // reading or mutating the repository in the background. Closing the
+          // session gives a timeout real stop semantics; the next retry opens
+          // a clean connection.
+          _abortTimedOutSession();
+          throw TimeoutException(
+            '$action timed out after ${_operationTimeout.inSeconds} seconds.',
+          );
+        },
       );
+
+  void _abortTimedOutSession() {
+    final client = _client;
+    _sftp = null;
+    _client = null;
+    client?.close();
+  }
 
   Future<SftpClient> get _connection async {
     if (_sftp != null) return _sftp!;
@@ -168,6 +190,7 @@ class SftpRepositoryGateway
     );
     final entries = names
         .where((item) => item.filename != '.' && item.filename != '..')
+        .where((item) => !Platform.isMacOS || !item.filename.startsWith('.'))
         .where((item) => item.filename != '__jet2drop_sync')
         .where((item) => item.filename != '__jet2drop_transfer')
         .where((item) => !item.filename.startsWith('.jet2drop-'))
@@ -363,6 +386,7 @@ class SftpRepositoryGateway
         inactivityTimer?.cancel();
         inactivityTimer = Timer(_operationTimeout, () {
           if (!inactivity.isCompleted) {
+            _abortTimedOutSession();
             inactivity.completeError(
               TimeoutException(
                 'Uploading file made no progress for ${_operationTimeout.inSeconds} seconds.',
@@ -523,17 +547,28 @@ class SftpRepositoryGateway
               )
               .timeout(
                 _operationTimeout,
-                onTimeout: (sink) => sink.addError(
-                  TimeoutException(
-                    'Downloading file made no progress for ${_operationTimeout.inSeconds} seconds.',
-                  ),
-                ),
+                onTimeout: (sink) {
+                  _abortTimedOutSession();
+                  sink
+                    ..addError(
+                      TimeoutException(
+                        'Downloading file made no progress for ${_operationTimeout.inSeconds} seconds.',
+                      ),
+                    )
+                    ..close();
+                },
               )) {
         await control?.checkpoint();
         checksum?.add(chunk);
         sink.add(chunk);
         written += chunk.length;
         onProgress?.call(written, total);
+      }
+      if (written != total) {
+        throw FileSystemException(
+          'Downloaded file size mismatch: expected $total bytes, received $written bytes.',
+          remotePath,
+        );
       }
       await sink.flush();
       await sink.close();

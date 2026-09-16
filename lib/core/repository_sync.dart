@@ -14,6 +14,59 @@ enum RepositorySyncStatus { synced, changed, syncing, needsAttention }
 
 enum RepositorySyncDirection { pull, push }
 
+/// The long-running phases reported by [RepositorySyncEngine].
+///
+/// Repository inspection and the final atomic commit do not have a reliable
+/// total ahead of time, so they intentionally remain indeterminate. File
+/// staging and fallback checksum reads carry byte/file totals and can expose a
+/// real progress fraction to the UI.
+enum RepositorySyncProgressPhase { checking, transferring, verifying, applying }
+
+typedef RepositorySyncProgressCallback =
+    void Function(RepositorySyncProgress progress);
+
+class RepositorySyncProgress {
+  const RepositorySyncProgress({
+    required this.phase,
+    this.direction,
+    this.transferredBytes = 0,
+    this.totalBytes = 0,
+    this.completedFiles = 0,
+    this.totalFiles = 0,
+    this.currentPath,
+  });
+
+  final RepositorySyncProgressPhase phase;
+  final RepositorySyncDirection? direction;
+  final int transferredBytes;
+  final int totalBytes;
+  final int completedFiles;
+  final int totalFiles;
+  final String? currentPath;
+
+  /// A null value means that the UI should show an indeterminate bar.
+  double? get fraction {
+    if (phase != RepositorySyncProgressPhase.transferring &&
+        phase != RepositorySyncProgressPhase.verifying) {
+      return null;
+    }
+    if (totalBytes > 0) {
+      final value = (transferredBytes / totalBytes).clamp(0.0, 1.0);
+      if (phase == RepositorySyncProgressPhase.transferring &&
+          completedFiles < totalFiles) {
+        return value.clamp(0.0, 0.99);
+      }
+      return value;
+    }
+    if (totalFiles > 0) {
+      return (completedFiles / totalFiles).clamp(0.0, 1.0);
+    }
+    return null;
+  }
+
+  bool get isDeterminate => fraction != null;
+}
+
 enum RepositorySyncConflictType {
   modifiedModified,
   modifiedDeleted,
@@ -352,6 +405,7 @@ class RepositorySyncEngine {
     DateTime Function()? now,
     this.trustRemoteManifest = true,
     this.lockTimeout = const Duration(minutes: 10),
+    this.onProgress,
   }) : metadataRoot =
            metadataRoot ?? Directory(_defaultMetadataPath(localRoot)),
        ownerId = ownerId ?? 'jet2drop-${uniqueSuffix()}',
@@ -370,6 +424,7 @@ class RepositorySyncEngine {
   final String ownerId;
   final Duration lockTimeout;
   final bool trustRemoteManifest;
+  final RepositorySyncProgressCallback? onProgress;
   final DateTime Function() _now;
 
   Future<void>? _operation;
@@ -396,6 +451,9 @@ class RepositorySyncEngine {
   }
 
   Future<RepositorySyncSnapshot> _inspectInternal() async {
+    _emitProgress(
+      const RepositorySyncProgress(phase: RepositorySyncProgressPhase.checking),
+    );
     await _recoverLocalTransactions();
     final baseline =
         await _readBaseline() ?? const <String, RepositorySyncEntry>{};
@@ -418,6 +476,12 @@ class RepositorySyncEngine {
   Future<RepositorySyncResult> _synchronize(
     RepositorySyncDirection direction,
   ) async {
+    _emitProgress(
+      RepositorySyncProgress(
+        phase: RepositorySyncProgressPhase.checking,
+        direction: direction,
+      ),
+    );
     await _recoverLocalTransactions();
     final baseline = await _readBaseline();
     final local = await _scanLocal();
@@ -461,6 +525,12 @@ class RepositorySyncEngine {
           applied: false,
         );
       }
+      _emitProgress(
+        RepositorySyncProgress(
+          phase: RepositorySyncProgressPhase.applying,
+          direction: direction,
+        ),
+      );
       final synced = await _finishWithCurrentBaseline(
         local: local,
         remote: remoteState.entries,
@@ -480,11 +550,16 @@ class RepositorySyncEngine {
     // commit guard later detects a competing change.
     _PreparedPull? preparedPull;
     _PreparedPush? preparedPush;
+    final progress = _SyncProgressTracker(
+      this,
+      direction: direction,
+      actions: planned,
+    );
     try {
       if (direction == RepositorySyncDirection.pull) {
-        preparedPull = await _stagePull(planned);
+        preparedPull = await _stagePull(planned, progress: progress);
       } else {
-        preparedPush = await _stagePush(planned);
+        preparedPush = await _stagePush(planned, progress: progress);
       }
     } catch (_) {
       await preparedPull?.dispose();
@@ -504,6 +579,7 @@ class RepositorySyncEngine {
       rethrow;
     }
     try {
+      progress.applying();
       await _recoverRemoteTransactions();
       final lockedBaseline = await _readBaseline();
       final lockedLocal = await _scanLocal();
@@ -647,6 +723,17 @@ class RepositorySyncEngine {
       }
       if (direction == RepositorySyncDirection.pull && remoteChanged) {
         actions.add(_SyncAction.pull(path: path, source: r, destination: l));
+      } else if (direction == RepositorySyncDirection.pull &&
+          _isLegacyTruncatedPull(l, r, b)) {
+        // The old baseline hash describes incomplete local bytes, not the
+        // complete remote file. Do not use it as an expected checksum.
+        actions.add(
+          _SyncAction.pull(
+            path: path,
+            source: r!.copyWith(sha256: null),
+            destination: l,
+          ),
+        );
       } else if (direction == RepositorySyncDirection.push && localChanged) {
         actions.add(_SyncAction.push(path: path, source: l, destination: r));
       }
@@ -670,7 +757,28 @@ class RepositorySyncEngine {
     return actions;
   }
 
-  Future<_PreparedPull> _stagePull(List<_SyncAction> actions) async {
+  bool _isLegacyTruncatedPull(
+    RepositorySyncEntry? local,
+    RepositorySyncEntry? remoteEntry,
+    RepositorySyncEntry? baseline,
+  ) =>
+      local != null &&
+      remoteEntry != null &&
+      baseline != null &&
+      !local.isDirectory &&
+      !remoteEntry.isDirectory &&
+      !baseline.isDirectory &&
+      baseline.sha256 != null &&
+      local.sha256 == baseline.sha256 &&
+      local.size < baseline.size &&
+      remoteEntry.size == baseline.size &&
+      remoteEntry.modifiedAt == baseline.modifiedAt &&
+      (remoteEntry.sha256 == null || remoteEntry.sha256 == baseline.sha256);
+
+  Future<_PreparedPull> _stagePull(
+    List<_SyncAction> actions, {
+    required _SyncProgressTracker progress,
+  }) async {
     final staging = Directory(
       '${metadataRoot.path}${Platform.pathSeparator}staging${Platform.pathSeparator}${uniqueSuffix()}',
     );
@@ -680,23 +788,33 @@ class RepositorySyncEngine {
       for (final action in actions) {
         final source = action.source;
         if (source == null || source.isDirectory) continue;
+        progress.startFile(action);
         final target = File(_join(staging.path, action.path));
         await target.parent.create(recursive: true);
         String? downloadedHash;
         await remote.downloadFile(
           remotePath: action.path,
           target: target,
+          onProgress: (transferred, _) =>
+              progress.transferred(action, transferred),
           onChecksum: (value) => downloadedHash = value,
         );
+        final downloadedSize = await target.length();
+        if (downloadedSize != source.size) {
+          throw RepositorySyncException('拉取文件大小校验失败：${action.path}');
+        }
         // Production gateways calculate this while streaming the download.
         // Keep a fallback for test/custom gateways that do not implement the
         // optional callback, without making the normal path read the file a
         // second time.
-        final hash = downloadedHash ?? await _hashFile(target);
+        final hash =
+            downloadedHash ??
+            await _hashFile(target, onProgress: progress.verifying(action));
         if (source.sha256 != null && source.sha256 != hash) {
           throw RepositorySyncException('拉取文件校验失败：${action.path}');
         }
         hashes[action.path] = hash;
+        progress.completeFile(action);
       }
       return _PreparedPull(staging: staging, actions: actions, hashes: hashes);
     } catch (_) {
@@ -803,7 +921,10 @@ class RepositorySyncEngine {
     }
   }
 
-  Future<_PreparedPush> _stagePush(List<_SyncAction> actions) async {
+  Future<_PreparedPush> _stagePush(
+    List<_SyncAction> actions, {
+    required _SyncProgressTracker progress,
+  }) async {
     final stagingPath =
         '$remoteMetadataRoot/$remoteStagingName/${uniqueSuffix()}';
     final pushedHashes = <String, String>{};
@@ -818,6 +939,7 @@ class RepositorySyncEngine {
           await _ensureRemoteDirectory(_join(stagingPath, action.path));
           continue;
         }
+        progress.startFile(action);
         await _ensureRemoteDirectory(
           _join(stagingPath, _parentPath(action.path)),
         );
@@ -830,12 +952,15 @@ class RepositorySyncEngine {
           targetDirectory: _parentPath(stagedPath),
           targetName: _baseName(stagedPath),
           overwrite: true,
+          onProgress: (transferred, _) =>
+              progress.transferred(action, transferred),
           onChecksum: (value) => uploadedHash = value,
         );
         if (uploadedHash == null) {
           throw RepositorySyncException('推送文件校验失败：${action.path}');
         }
         pushedHashes[action.path] = uploadedHash!;
+        progress.completeFile(action);
         stagedSizes[stagedPath] = fileSize;
         stagedParents.add(_parentPath(stagedPath));
       }
@@ -1393,6 +1518,16 @@ class RepositorySyncEngine {
       // those baseline-hashed files whose cheap metadata differs; ordinary
       // unchanged files remain on the size/mtime fast path.
       if (b?.sha256 != null && !b!.isDirectory) {
+        // Older clients recorded a full remote size with a hash of truncated
+        // local bytes. Hash size-mismatched files to identify only that exact
+        // legacy state; genuine local edits remain untouched.
+        if (l != null &&
+            !l.isDirectory &&
+            l.size != b.size &&
+            l.sha256 == null) {
+          l = l.copyWith(sha256: await _hashLocal(path));
+          localMutable[path] = l;
+        }
         if (l != null &&
             l.sha256 == null &&
             l.size == b.size &&
@@ -1519,7 +1654,8 @@ class RepositorySyncEngine {
     );
   }
 
-  Future<String> _hashLocal(String path) => _hashFile(File(_localPath(path)));
+  Future<String> _hashLocal(String path) =>
+      _hashFile(File(_localPath(path)), progressPath: path);
 
   Future<String> _hashRemote(String path) async {
     final target = File(
@@ -1531,18 +1667,48 @@ class RepositorySyncEngine {
       await remote.downloadFile(
         remotePath: path,
         target: target,
+        onProgress: (transferred, total) => _emitProgress(
+          RepositorySyncProgress(
+            phase: RepositorySyncProgressPhase.verifying,
+            transferredBytes: transferred,
+            totalBytes: total,
+            completedFiles: 0,
+            totalFiles: 1,
+            currentPath: path,
+          ),
+        ),
         onChecksum: (value) => streamedHash = value,
       );
-      return streamedHash ?? await _hashFile(target);
+      return streamedHash ?? _hashFile(target, progressPath: path);
     } finally {
       if (await target.exists()) await target.delete();
     }
   }
 
-  Future<String> _hashFile(File file) async {
+  Future<String> _hashFile(
+    File file, {
+    String? progressPath,
+    void Function(int transferred, int total)? onProgress,
+  }) async {
     final accumulator = Sha256Accumulator();
+    final total = await file.length();
+    var transferred = 0;
     await for (final chunk in file.openRead()) {
       accumulator.add(chunk);
+      transferred += chunk.length;
+      onProgress?.call(transferred, total);
+      if (progressPath != null) {
+        _emitProgress(
+          RepositorySyncProgress(
+            phase: RepositorySyncProgressPhase.verifying,
+            transferredBytes: transferred,
+            totalBytes: total,
+            completedFiles: 0,
+            totalFiles: 1,
+            currentPath: progressPath,
+          ),
+        );
+      }
     }
     return accumulator.close();
   }
@@ -1750,7 +1916,7 @@ class RepositorySyncEngine {
           part == remoteMetadataRoot ||
           part == '__jet2drop_transfer' ||
           part == localMetadataName ||
-          part.startsWith('.jet2drop-') ||
+          part.startsWith('.') ||
           part.contains('.jet2drop-upload-') ||
           part.contains('.jet2drop-download-') ||
           part.contains('.jet2drop-backup-') ||
@@ -1782,6 +1948,15 @@ class RepositorySyncEngine {
       conflicts: comparison.conflicts,
       remoteRevision: remoteRevision,
     );
+  }
+
+  void _emitProgress(RepositorySyncProgress progress) {
+    try {
+      onProgress?.call(progress);
+    } catch (_) {
+      // Progress is observational. A UI listener must never turn a
+      // successfully staged repository operation into a failed sync.
+    }
   }
 
   static List<String> _deleteDeepestFirst(Iterable<String> paths) {
@@ -1817,6 +1992,83 @@ class RepositorySyncEngine {
         await backup.delete();
       } catch (_) {}
     }
+  }
+}
+
+class _SyncProgressTracker {
+  _SyncProgressTracker(
+    this.engine, {
+    required this.direction,
+    required List<_SyncAction> actions,
+  }) : _totalFiles = actions.where(_isTransferFile).length,
+       _totalBytes = actions
+           .where(_isTransferFile)
+           .fold<int>(0, (sum, action) => sum + (action.source?.size ?? 0));
+
+  final RepositorySyncEngine engine;
+  final RepositorySyncDirection direction;
+  final int _totalFiles;
+  final int _totalBytes;
+  int _completedFiles = 0;
+  int _completedBytes = 0;
+  _SyncAction? _currentAction;
+  int _currentBytes = 0;
+
+  static bool _isTransferFile(_SyncAction action) =>
+      action.source != null && !action.source!.isDirectory;
+
+  void startFile(_SyncAction action) {
+    _currentAction = action;
+    _currentBytes = 0;
+    _emit(RepositorySyncProgressPhase.transferring);
+  }
+
+  void transferred(_SyncAction action, int bytes) {
+    if (!identical(_currentAction, action)) startFile(action);
+    final total = action.source?.size ?? 0;
+    _currentBytes = bytes.clamp(0, total);
+    _emit(RepositorySyncProgressPhase.transferring);
+  }
+
+  void Function(int transferred, int total) verifying(_SyncAction action) {
+    return (transferred, total) {
+      if (!identical(_currentAction, action)) startFile(action);
+      _currentBytes = transferred.clamp(0, action.source?.size ?? total);
+      _emit(RepositorySyncProgressPhase.verifying);
+    };
+  }
+
+  void completeFile(_SyncAction action) {
+    if (!identical(_currentAction, action)) startFile(action);
+    _completedFiles++;
+    _completedBytes += action.source?.size ?? 0;
+    _currentBytes = 0;
+    _emit(RepositorySyncProgressPhase.transferring);
+    _currentAction = null;
+    _currentBytes = 0;
+  }
+
+  void applying() {
+    engine._emitProgress(
+      RepositorySyncProgress(
+        phase: RepositorySyncProgressPhase.applying,
+        direction: direction,
+      ),
+    );
+  }
+
+  void _emit(RepositorySyncProgressPhase phase) {
+    engine._emitProgress(
+      RepositorySyncProgress(
+        phase: phase,
+        direction: direction,
+        transferredBytes: _completedBytes + _currentBytes,
+        totalBytes: _totalBytes,
+        completedFiles: _completedFiles,
+        totalFiles: _totalFiles,
+        currentPath: _currentAction?.path,
+      ),
+    );
   }
 }
 

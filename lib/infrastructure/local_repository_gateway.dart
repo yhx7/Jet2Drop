@@ -105,7 +105,9 @@ class LocalRepositoryGateway
       // Read the basename from the filesystem path. URI decoding here would
       // decode a literal '%' in a valid Windows filename a second time.
       final name = entity.path.split(Platform.pathSeparator).last;
-      if (name == '.jet2drop-history' ||
+      if ((Platform.isMacOS && name.startsWith('.')) ||
+          name == '.jet2drop-history' ||
+          name == '.jet2drop_sync' ||
           name == '__jet2drop_sync' ||
           name == '__jet2drop_transfer' ||
           name.startsWith('.jet2drop-') ||
