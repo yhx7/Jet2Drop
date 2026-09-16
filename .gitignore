@@ -39,6 +39,9 @@ migrate_working_dir/
 /dist/
 /coverage/
 /local-config/
+# Local development and private implementation material.
+/AGENTS.md
+/Jet2Drop 项目需求与开发方案.md
 
 # Symbolication related
 app.*.symbols
