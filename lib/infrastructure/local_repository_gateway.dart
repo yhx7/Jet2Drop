@@ -7,15 +7,44 @@ import '../core/path_utils.dart';
 import '../core/repository_gateway.dart';
 import '../core/transfer_control.dart';
 
-class LocalRepositoryGateway implements RepositoryGateway {
+class LocalRepositoryGateway
+    implements
+        RepositoryGateway,
+        AtomicRepositoryGateway,
+        RepositorySyncManifestInvalidator {
   LocalRepositoryGateway(this.rootPath);
 
   final String rootPath;
+  StreamSubscription<FileSystemEvent>? _repositoryWatch;
 
   Directory get _root => Directory(rootPath);
 
   @override
-  Future<void> initialize() => _root.create(recursive: true);
+  Future<void> initialize() async {
+    await _root.create(recursive: true);
+    if (!Platform.isWindows) return;
+    await invalidateRepositorySyncManifest();
+    try {
+      _repositoryWatch = _root.watch(recursive: true).listen((event) {
+        if (_isInternalEvent(event.path)) return;
+        unawaited(invalidateRepositorySyncManifest());
+      });
+    } catch (_) {
+      // Ordinary Jet2Drop writes still invalidate explicitly. Startup also
+      // invalidates, so a missing watcher only postpones external detection.
+    }
+  }
+
+  bool _isInternalEvent(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    return normalized.contains('/__jet2drop_sync/') ||
+        normalized.endsWith('/__jet2drop_sync') ||
+        normalized.contains('/__jet2drop_transfer/') ||
+        normalized.contains('/.jet2drop-') ||
+        normalized.contains('.jet2drop-upload-') ||
+        normalized.contains('.jet2drop-download-') ||
+        normalized.contains('.jet2drop-backup-');
+  }
 
   @override
   Future<int?> availableBytes(String relativePath) async => null;
@@ -77,6 +106,7 @@ class LocalRepositoryGateway implements RepositoryGateway {
       // decode a literal '%' in a valid Windows filename a second time.
       final name = entity.path.split(Platform.pathSeparator).last;
       if (name == '.jet2drop-history' ||
+          name == '__jet2drop_sync' ||
           name == '__jet2drop_transfer' ||
           name.startsWith('.jet2drop-') ||
           name.contains('.jet2drop-upload-') ||
@@ -135,6 +165,66 @@ class LocalRepositoryGateway implements RepositoryGateway {
       return;
     }
     await File(path).delete();
+  }
+
+  @override
+  Future<void> invalidateRepositorySyncManifest() async {
+    final manifest = File(
+      '$rootPath${Platform.pathSeparator}__jet2drop_sync${Platform.pathSeparator}manifest.json',
+    );
+    if (await manifest.exists()) await manifest.delete();
+  }
+
+  @override
+  Future<void> moveEntry(
+    String sourcePath,
+    String targetPath, {
+    bool overwrite = false,
+  }) async {
+    final sourcePathValue = _entityFor(sourcePath).path;
+    final targetPathValue = _entityFor(targetPath).path;
+    final sourceType = await FileSystemEntity.type(
+      sourcePathValue,
+      followLinks: false,
+    );
+    if (sourceType == FileSystemEntityType.notFound) {
+      throw FileSystemException('File not found.', sourcePathValue);
+    }
+    await Directory(targetPathValue).parent.create(recursive: true);
+    final targetType = await FileSystemEntity.type(
+      targetPathValue,
+      followLinks: false,
+    );
+    if (targetType != FileSystemEntityType.notFound) {
+      if (!overwrite) {
+        throw FileSystemException('A file with the same name already exists.');
+      }
+      final backupPath = '$targetPathValue.jet2drop-backup-${uniqueSuffix()}';
+      final backup = targetType == FileSystemEntityType.directory
+          ? Directory(backupPath)
+          : File(backupPath);
+      final target = targetType == FileSystemEntityType.directory
+          ? Directory(targetPathValue)
+          : File(targetPathValue);
+      final source = sourceType == FileSystemEntityType.directory
+          ? Directory(sourcePathValue)
+          : File(sourcePathValue);
+      await target.rename(backup.path);
+      try {
+        await source.rename(targetPathValue);
+      } catch (_) {
+        if (await backup.exists()) await backup.rename(targetPathValue);
+        rethrow;
+      }
+      try {
+        if (await backup.exists()) await backup.delete(recursive: true);
+      } catch (_) {}
+      return;
+    }
+    final source = sourceType == FileSystemEntityType.directory
+        ? Directory(sourcePathValue)
+        : File(sourcePathValue);
+    await source.rename(targetPathValue);
   }
 
   @override
@@ -329,5 +419,8 @@ class LocalRepositoryGateway implements RepositoryGateway {
   }
 
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    await _repositoryWatch?.cancel();
+    _repositoryWatch = null;
+  }
 }

@@ -18,10 +18,23 @@ class MacosSecurityScope {
     return _channel.invokeMethod<String>('restoreDirectoryAccess');
   }
 
+  /// Restores the separate bookmark used by the Mac repository mirror.
+  static Future<String?> restoreSyncDirectoryAccess() async {
+    if (!Platform.isMacOS) return null;
+    return _channel.invokeMethod<String>('restoreSyncDirectoryAccess');
+  }
+
   /// Creates and persists an app-scoped bookmark for [path]. The native side
   /// starts the new scope before replacing the previous one.
   static Future<void> persistDirectoryAccess(String path) async {
     if (!Platform.isMacOS) return;
     await _channel.invokeMethod<void>('persistDirectoryAccess', {'path': path});
+  }
+
+  static Future<void> persistSyncDirectoryAccess(String path) async {
+    if (!Platform.isMacOS) return;
+    await _channel.invokeMethod<void>('persistSyncDirectoryAccess', {
+      'path': path,
+    });
   }
 }

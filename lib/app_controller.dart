@@ -14,6 +14,7 @@ import 'core/models/quick_device.dart';
 import 'core/connection_retry.dart';
 import 'core/path_utils.dart';
 import 'core/repository_gateway.dart';
+import 'core/repository_sync.dart';
 import 'core/transfer_control.dart';
 import 'infrastructure/local_repository_gateway.dart';
 import 'infrastructure/serialized_repository_gateway.dart';
@@ -28,7 +29,7 @@ import 'platform/android_save_file.dart';
 import 'platform/macos_security_scope.dart';
 import 'platform/desktop_lifecycle_bridge.dart';
 
-enum RepositoryMode { local, sftp }
+enum RepositoryMode { local, sftp, macSync }
 
 enum RepositoryConnectionStatus {
   disconnected,
@@ -72,6 +73,7 @@ class AppController extends ChangeNotifier {
 
   static const _modeKey = 'repository_mode';
   static const _rootKey = 'local_root';
+  static const _syncRootKey = 'mac_sync_root';
   static const _hostKey = 'sftp_host';
   static const _portKey = 'sftp_port';
   static const _usernameKey = 'sftp_username';
@@ -104,6 +106,8 @@ class AppController extends ChangeNotifier {
   late SharedPreferences _preferences;
   bool _preferencesReady = false;
   RepositoryGateway? _gateway;
+  RepositoryGateway? _syncGateway;
+  RepositorySyncEngine? _syncEngine;
   Future<void>? _connectFuture;
 
   bool isReady = false;
@@ -120,6 +124,9 @@ class AppController extends ChangeNotifier {
   String? quickError;
   String currentPath = '';
   String? error;
+  RepositorySyncStatus syncStatus = RepositorySyncStatus.synced;
+  String syncStatusMessage = '尚未配置本地副本';
+  List<RepositorySyncConflict> syncConflicts = const [];
   List<FileEntry> entries = const [];
   final List<TransferTask> tasks = [];
   final Map<String, TransferControl> _transferControls = {};
@@ -321,8 +328,20 @@ class AppController extends ChangeNotifier {
   RepositoryMode mode = Platform.isWindows
       ? RepositoryMode.local
       : RepositoryMode.sftp;
-  String localRoot = r'E:\Repository';
+  String localRoot = Platform.isWindows ? r'E:\Repository' : '';
   SftpConnectionProfile? sftpProfile;
+
+  bool get isMacRepositoryMirror => mode == RepositoryMode.macSync;
+
+  bool get isSyncInProgress =>
+      mode == RepositoryMode.macSync &&
+      syncStatus == RepositorySyncStatus.syncing;
+
+  bool get isLocalRepository =>
+      mode == RepositoryMode.local || mode == RepositoryMode.macSync;
+
+  RepositoryGateway? get _quickGateway =>
+      mode == RepositoryMode.macSync ? _syncGateway : _gateway;
 
   Future<void> initialize() async {
     isInitializing = true;
@@ -335,16 +354,37 @@ class AppController extends ChangeNotifier {
         _preferences.getString(_sortFieldKey) ?? FileSortField.name.name,
       );
       sortAscending = _preferences.getBool(_sortAscendingKey) ?? true;
-      localRoot = _preferences.getString(_rootKey) ?? r'E:\Repository';
-      await _loadDefaultQuickSaveDirectory();
-      quickTransferMode = _quickTransferModeFromPreferences();
+      final savedMode = _preferences.getString(_modeKey);
       mode = RepositoryMode.values.byName(
-        _preferences.getString(_modeKey) ??
+        savedMode ??
             (Platform.isWindows
                 ? RepositoryMode.local.name
                 : RepositoryMode.sftp.name),
       );
-      if (mode == RepositoryMode.sftp) await _loadSftpProfile();
+      if (mode == RepositoryMode.macSync && !Platform.isMacOS) {
+        mode = Platform.isWindows ? RepositoryMode.local : RepositoryMode.sftp;
+      }
+      localRoot =
+          _preferences.getString(_rootKey) ??
+          (Platform.isWindows ? r'E:\Repository' : '');
+      final savedSyncRoot = _preferences.getString(_syncRootKey);
+      if (mode == RepositoryMode.macSync &&
+          savedSyncRoot != null &&
+          savedSyncRoot.trim().isNotEmpty) {
+        localRoot = savedSyncRoot.trim();
+      }
+      await _loadDefaultQuickSaveDirectory();
+      quickTransferMode = _quickTransferModeFromPreferences();
+      if (mode == RepositoryMode.sftp || mode == RepositoryMode.macSync) {
+        await _loadSftpProfile();
+      }
+      if (mode == RepositoryMode.macSync && Platform.isMacOS) {
+        final restored = await MacosSecurityScope.restoreSyncDirectoryAccess();
+        if (restored != null && restored.trim().isNotEmpty) {
+          localRoot = restored.trim();
+          await _preferences.setString(_syncRootKey, localRoot);
+        }
+      }
       // Quick transfer identity, peer metadata, and the desktop direct
       // receiver do not depend on the repository session.  Initialize them
       // before connecting so the quick page remains useful while SFTPGo is
@@ -680,7 +720,7 @@ class AppController extends ChangeNotifier {
           };
           _cleanupActions[id] = () async {
             try {
-              await _gateway!.deleteEntry(
+              await _quickGateway!.deleteEntry(
                 '$_quickRoot/$_quickMessages/$id',
                 recursive: true,
               );
@@ -832,6 +872,8 @@ class AppController extends ChangeNotifier {
       onCommit: () async {
         localRoot = clean;
         mode = RepositoryMode.local;
+        _syncEngine = null;
+        await _preferences.remove(_syncRootKey);
         await _preferences.setString(_rootKey, clean);
         await _preferences.setString(_modeKey, mode.name);
       },
@@ -854,6 +896,8 @@ class AppController extends ChangeNotifier {
       onCommit: () async {
         sftpProfile = profile;
         mode = RepositoryMode.sftp;
+        _syncEngine = null;
+        await _preferences.remove(_syncRootKey);
         await _preferences.setString(_hostKey, profile.host);
         await _preferences.setInt(_portKey, profile.port);
         await _preferences.setString(_usernameKey, profile.username);
@@ -865,6 +909,100 @@ class AppController extends ChangeNotifier {
         await _secretVault.write(_passwordKey, profile.password);
       },
     );
+  }
+
+  /// Configures the Mac's offline mirror. The selected directory is the
+  /// browsable local repository; SFTP remains the Windows source of truth.
+  Future<void> configureMacSync({
+    required String path,
+    required SftpConnectionProfile profile,
+  }) async {
+    if (!Platform.isMacOS) {
+      throw StateError('本地副本同步只支持 macOS。');
+    }
+    if (hasActiveTransfers) {
+      throw StateError('Wait for active transfers before changing connection.');
+    }
+    final clean = path.trim();
+    if (clean.isEmpty) throw ArgumentError('请选择 Mac 本地副本目录。');
+    await Directory(clean).create(recursive: true);
+    final localCandidate = LocalRepositoryGateway(clean);
+    final support = await getApplicationSupportDirectory();
+    final remoteCandidate = SerializedRepositoryGateway(
+      SftpRepositoryGateway(
+        profile,
+        Directory('${support.path}${Platform.pathSeparator}sync-cache'),
+      ),
+    );
+    // Persisting the bookmark before connecting ensures a restart can restore
+    // the exact directory even when the first remote connection is offline.
+    await MacosSecurityScope.persistSyncDirectoryAccess(clean);
+    await _activateMacSyncCandidates(
+      localCandidate: localCandidate,
+      remoteCandidate: remoteCandidate,
+      localPath: clean,
+      profile: profile,
+    );
+  }
+
+  Future<void> _activateMacSyncCandidates({
+    required RepositoryGateway localCandidate,
+    required RepositoryGateway remoteCandidate,
+    required String localPath,
+    required SftpConnectionProfile profile,
+  }) async {
+    isLoading = true;
+    connectionStatus = RepositoryConnectionStatus.connecting;
+    notifyListeners();
+    try {
+      await localCandidate.initialize().timeout(const Duration(seconds: 15));
+      final candidateEntries = await localCandidate
+          .listDirectory('')
+          .timeout(const Duration(seconds: 15));
+      final previous = _gateway;
+      final previousSync = _syncGateway;
+      localRoot = localPath;
+      sftpProfile = profile;
+      mode = RepositoryMode.macSync;
+      await _preferences.setString(_rootKey, localPath);
+      await _preferences.setString(_syncRootKey, localPath);
+      await _preferences.setString(_modeKey, mode.name);
+      await _preferences.setString(_hostKey, profile.host);
+      await _preferences.setInt(_portKey, profile.port);
+      await _preferences.setString(_usernameKey, profile.username);
+      await _preferences.setString(_fingerprintKey, profile.hostKeyFingerprint);
+      await _secretVault.write(_passwordKey, profile.password);
+      _gateway = localCandidate;
+      _syncGateway = remoteCandidate;
+      _syncEngine = RepositorySyncEngine(
+        localRoot: Directory(localPath),
+        remote: remoteCandidate,
+      );
+      _invalidateQuickState();
+      currentPath = '';
+      entries = candidateEntries;
+      isReady = true;
+      needsTailscale = false;
+      error = null;
+      connectionStatus = RepositoryConnectionStatus.connected;
+      isLoading = false;
+      notifyListeners();
+      await previous?.dispose();
+      if (!identical(previousSync, remoteCandidate)) {
+        await previousSync?.dispose();
+      }
+      unawaited(_refreshSyncSnapshot());
+      unawaited(_initializeQuickTransferSafely());
+    } catch (_) {
+      await localCandidate.dispose();
+      await remoteCandidate.dispose();
+      rethrow;
+    } finally {
+      if (isLoading) {
+        isLoading = false;
+        notifyListeners();
+      }
+    }
   }
 
   Future<void> _activateCandidate(
@@ -881,7 +1019,10 @@ class AppController extends ChangeNotifier {
           .timeout(const Duration(seconds: 15));
       await onCommit();
       final previous = _gateway;
+      final previousSync = _syncGateway;
       _gateway = candidate;
+      _syncGateway = null;
+      _syncEngine = null;
       _invalidateQuickState();
       currentPath = '';
       entries = candidateEntries;
@@ -894,6 +1035,7 @@ class AppController extends ChangeNotifier {
       isLoading = false;
       notifyListeners();
       await previous?.dispose();
+      if (!identical(previousSync, candidate)) await previousSync?.dispose();
       unawaited(_initializeQuickTransferSafely());
     } catch (_) {
       await candidate.dispose();
@@ -934,8 +1076,31 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     try {
       await _gateway?.dispose();
+      await _syncGateway?.dispose();
+      _syncGateway = null;
+      _syncEngine = null;
       if (mode == RepositoryMode.local) {
         _gateway = LocalRepositoryGateway(localRoot);
+      } else if (mode == RepositoryMode.macSync) {
+        if (!Platform.isMacOS || localRoot.trim().isEmpty) {
+          throw StateError('请先选择 Mac 本地副本目录。');
+        }
+        final profile = sftpProfile;
+        if (profile == null) {
+          throw StateError('请在连接设置中填写 SFTPGo 的主机、账号、密码和主机密钥指纹。');
+        }
+        final support = await getApplicationSupportDirectory();
+        _gateway = LocalRepositoryGateway(localRoot);
+        _syncGateway = SerializedRepositoryGateway(
+          SftpRepositoryGateway(
+            profile,
+            Directory('${support.path}${Platform.pathSeparator}sync-cache'),
+          ),
+        );
+        _syncEngine = RepositorySyncEngine(
+          localRoot: Directory(localRoot),
+          remote: _syncGateway!,
+        );
       } else {
         final profile = sftpProfile;
         if (profile == null) {
@@ -961,6 +1126,7 @@ class AppController extends ChangeNotifier {
       // The repository is usable now.  Do not hold the primary startup or
       // reconnect spinner open while quick-transfer metadata is prepared.
       notifyListeners();
+      if (mode == RepositoryMode.macSync) unawaited(_refreshSyncSnapshot());
       unawaited(_initializeQuickTransferSafely());
     } catch (exception) {
       error = describeError(exception);
@@ -1170,9 +1336,78 @@ class AppController extends ChangeNotifier {
     unawaited(_maintainQuickPresence());
   }
 
+  Future<void> _refreshSyncSnapshot() async {
+    final engine = _syncEngine;
+    if (engine == null || mode != RepositoryMode.macSync) return;
+    try {
+      final snapshot = await engine.inspect();
+      syncStatus = snapshot.status;
+      syncStatusMessage = snapshot.message;
+      syncConflicts = snapshot.conflicts;
+      notifyListeners();
+    } catch (exception) {
+      syncStatus = RepositorySyncStatus.needsAttention;
+      syncStatusMessage = describeError(exception);
+      syncConflicts = const [];
+      notifyListeners();
+    }
+  }
+
+  Future<RepositorySyncResult?> pullRepositoryUpdates() =>
+      _runRepositorySync(RepositorySyncDirection.pull);
+
+  Future<RepositorySyncResult?> pushRepositoryUpdates() =>
+      _runRepositorySync(RepositorySyncDirection.push);
+
+  Future<RepositorySyncResult?> _runRepositorySync(
+    RepositorySyncDirection direction,
+  ) async {
+    final engine = _syncEngine;
+    if (mode != RepositoryMode.macSync || engine == null) {
+      throw StateError('请先配置 Mac 本地副本。');
+    }
+    if (hasActiveTransfers || isLoading) {
+      throw StateError('有其他任务正在运行，请稍后再同步。');
+    }
+    if (isSyncInProgress) {
+      throw StateError('同步正在进行中，请等待当前操作完成。');
+    }
+    syncStatus = RepositorySyncStatus.syncing;
+    syncStatusMessage = direction == RepositorySyncDirection.pull
+        ? '正在拉取更新…'
+        : '正在推送更新…';
+    syncConflicts = const [];
+    notifyListeners();
+    try {
+      final result = direction == RepositorySyncDirection.pull
+          ? await engine.pull()
+          : await engine.push();
+      syncStatus = result.snapshot.status;
+      syncStatusMessage = result.snapshot.message;
+      syncConflicts = result.conflicts;
+      if (result.applied) {
+        entries = await _gateway!.listDirectory(currentPath);
+      }
+      notifyListeners();
+      return result;
+    } catch (exception) {
+      syncStatus = RepositorySyncStatus.needsAttention;
+      syncStatusMessage = describeError(exception);
+      syncConflicts = exception is RepositorySyncException
+          ? exception.conflicts
+          : const [];
+      notifyListeners();
+      rethrow;
+    }
+  }
+
   Future<void> refresh() async {
+    // Repository browsing always follows the active repository copy. In
+    // macSync mode that is the local mirror; the central SFTP gateway is only
+    // used by quick transfer and the explicit sync engine.
     final gateway = _gateway;
     if (gateway == null || _isRefreshingRepository) return;
+    if (isSyncInProgress) return;
     if (hasRunningTransfers) {
       _repositoryRefreshPending = true;
       return;
@@ -1201,7 +1436,9 @@ class AppController extends ChangeNotifier {
   }
 
   bool _isTailscaleConnectivityError(Object exception) {
-    if (mode != RepositoryMode.sftp) return false;
+    if (mode != RepositoryMode.sftp && mode != RepositoryMode.macSync) {
+      return false;
+    }
     final message = exception.toString().toLowerCase();
     return message.contains('failed host lookup') ||
         message.contains('no address associated with hostname') ||
@@ -1226,7 +1463,7 @@ class AppController extends ChangeNotifier {
   Future<_QuickPayloadInspection> _inspectMissingQuickPayload(
     String messagePath,
   ) async {
-    final gateway = _gateway;
+    final gateway = _quickGateway;
     if (gateway == null) {
       return (state: _QuickPayloadState.unknown, claimedManifest: null);
     }
@@ -1404,7 +1641,7 @@ class AppController extends ChangeNotifier {
     // A disconnected repository must not block the quick page or direct
     // receiver.  Relay directories and presence are simply deferred until a
     // gateway is available.
-    if (!isReady || _gateway == null) return;
+    if (!isReady || _quickGateway == null) return;
     await _ensureQuickDirectories(generation: generation);
     if (generation != _quickSessionGeneration) return;
     await _publishDeviceRegistration();
@@ -1543,7 +1780,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _ensureQuickDirectories({int? generation}) async {
-    final gateway = _gateway;
+    final gateway = _quickGateway;
     if (gateway == null) throw StateError('Repository is not connected.');
     await _ensureDirectory('', _quickRoot, gateway: gateway);
     if (generation != null && generation != _quickSessionGeneration) return;
@@ -1557,7 +1794,7 @@ class AppController extends ChangeNotifier {
     String name, {
     RepositoryGateway? gateway,
   }) async {
-    final targetGateway = gateway ?? _gateway;
+    final targetGateway = gateway ?? _quickGateway;
     if (targetGateway == null) {
       throw StateError('Repository is not connected.');
     }
@@ -1593,7 +1830,7 @@ class AppController extends ChangeNotifier {
     );
     try {
       await _retryOperation(
-        () => _gateway!.uploadFile(
+        () => _quickGateway!.uploadFile(
           source: source,
           targetDirectory: '$_quickRoot/devices',
           targetName: '$deviceId.json',
@@ -1656,7 +1893,7 @@ class AppController extends ChangeNotifier {
     );
     try {
       await _retryOperation(
-        () => _gateway!.downloadFile(remotePath: remotePath, target: file),
+        () => _quickGateway!.downloadFile(remotePath: remotePath, target: file),
       );
       return await file.readAsString();
     } finally {
@@ -1665,7 +1902,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> refreshQuickTransfer({bool refreshDevices = false}) async {
-    final gateway = _gateway;
+    final gateway = _quickGateway;
     if (deviceId.isEmpty) {
       return;
     }
@@ -1774,7 +2011,7 @@ class AppController extends ChangeNotifier {
             // always observe the current manifest there. SFTP keeps the
             // cache because the package directory listing is the authoritative
             // change signal and each manifest read costs another relay RTT.
-            final cached = mode == RepositoryMode.sftp
+            final cached = mode != RepositoryMode.local
                 ? _quickManifestCache[manifestPath]
                 : null;
             var value =
@@ -1845,7 +2082,7 @@ class AppController extends ChangeNotifier {
       }
       inbox.sort((left, right) => right.createdAt.compareTo(left.createdAt));
       if (generation == _quickRefreshGeneration &&
-          identical(gateway, _gateway)) {
+          identical(gateway, _quickGateway)) {
         quickDevices = registered;
         quickInbox = inbox;
         quickError = null;
@@ -1855,7 +2092,7 @@ class AppController extends ChangeNotifier {
       }
     } catch (exception) {
       if (generation == _quickRefreshGeneration &&
-          identical(gateway, _gateway) &&
+          identical(gateway, _quickGateway) &&
           !hasRunningTransfers) {
         quickError = describeError(exception);
         notifyListeners();
@@ -1894,6 +2131,9 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> createDirectory(String name) async {
+    if (isSyncInProgress) {
+      throw StateError('同步进行中，请完成后再修改本地副本。');
+    }
     final safeName = sanitizeTransferFileName(name);
     if (entries.any(
       (entry) => entry.name.toLowerCase() == safeName.toLowerCase(),
@@ -1903,13 +2143,18 @@ class AppController extends ChangeNotifier {
     await _retryOperation(
       () => _gateway!.createDirectory(currentPath, safeName),
     );
+    await _invalidateCentralSyncManifest();
     await refresh();
   }
 
   Future<void> deleteEntry(FileEntry entry) async {
+    if (isSyncInProgress) {
+      throw StateError('同步进行中，请完成后再修改本地副本。');
+    }
     await _retryOperation(
       () => _gateway!.deleteEntry(entry.path, recursive: entry.isDirectory),
     );
+    await _invalidateCentralSyncManifest();
     await refresh();
   }
 
@@ -1918,6 +2163,9 @@ class AppController extends ChangeNotifier {
     required bool overwrite,
     bool keepBoth = false,
   }) async {
+    if (isSyncInProgress) {
+      throw StateError('同步进行中，请完成后再修改本地副本。');
+    }
     await validateTransferSelection(files);
     final reservedNames = entries
         .map((entry) => entry.name.toLowerCase())
@@ -2011,6 +2259,7 @@ class AppController extends ChangeNotifier {
           control: control,
         ),
       );
+      await _invalidateCentralSyncManifest();
       task
         ..transferredBytes = task.totalBytes
         ..status = TransferStatus.completed;
@@ -2502,9 +2751,13 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _preflightReliableRelay() async {
-    final gateway = _gateway;
+    if (isSyncInProgress) {
+      throw StateError('同步进行中，请完成后再发起仓库传输。');
+    }
+    final gateway = _quickGateway;
     if (gateway == null || !isReady) {
-      if (mode == RepositoryMode.sftp && sftpProfile == null) {
+      if ((mode == RepositoryMode.sftp || mode == RepositoryMode.macSync) &&
+          sftpProfile == null) {
         throw StateError('请先完成 SFTPGo 连接配置，才能使用可靠中转。');
       }
       if (mode == RepositoryMode.local) {
@@ -2576,7 +2829,7 @@ class AppController extends ChangeNotifier {
     _syncForegroundTransfer(force: true);
     _cleanupActions[task.id] = () async {
       try {
-        await _gateway!.deleteEntry(
+        await _quickGateway!.deleteEntry(
           '$_quickRoot/$_quickMessages/${task.id}',
           recursive: true,
         );
@@ -2925,7 +3178,11 @@ class AppController extends ChangeNotifier {
   }) async {
     Directory? staging;
     try {
-      await _ensureRemoteSpace(task.totalBytes, _quickRoot);
+      await _ensureRemoteSpace(
+        task.totalBytes,
+        _quickRoot,
+        gateway: _quickGateway,
+      );
       final support = await getApplicationSupportDirectory();
       staging = Directory(
         '${support.path}${Platform.pathSeparator}quick-transfer-staging${Platform.pathSeparator}${uniqueSuffix()}',
@@ -2935,7 +3192,7 @@ class AppController extends ChangeNotifier {
       await _ensureDirectory('$_quickRoot/$_quickMessages', task.id);
       String? checksum;
       await _retryOperation(
-        () => _gateway!.uploadFile(
+        () => _quickGateway!.uploadFile(
           source: source,
           targetDirectory: remotePackage,
           targetName: 'payload.bin',
@@ -2971,7 +3228,7 @@ class AppController extends ChangeNotifier {
       task.status = TransferStatus.finalizing;
       notifyListeners();
       await _retryOperation(
-        () => _gateway!.uploadFile(
+        () => _quickGateway!.uploadFile(
           source: manifestFile,
           targetDirectory: remotePackage,
           targetName: 'manifest.json',
@@ -3167,7 +3424,7 @@ class AppController extends ChangeNotifier {
           final remotePackage = '$_quickRoot/$_quickMessages/${manifest.id}';
           try {
             await _retryOperation(
-              () => _gateway!.downloadFile(
+              () => _quickGateway!.downloadFile(
                 remotePath: '$remotePackage/payload.bin',
                 target: payload,
                 resumeId: manifest.id,
@@ -3288,7 +3545,7 @@ class AppController extends ChangeNotifier {
     try {
       final messagePath = '$_quickRoot/$_quickMessages/${manifest.id}';
       await _retryOperation(
-        () => _gateway!.uploadFile(
+        () => _quickGateway!.uploadFile(
           source: source,
           targetDirectory: messagePath,
           targetName: 'receipt.json',
@@ -3301,7 +3558,7 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       try {
         await _retryOperation(
-          () => _gateway!.deleteEntry(
+          () => _quickGateway!.deleteEntry(
             '$messagePath/payload.bin',
             recursive: false,
           ),
@@ -3363,13 +3620,13 @@ class AppController extends ChangeNotifier {
       try {
         try {
           await _retryOperation(
-            () => _gateway!.deleteEntry(messagePath, recursive: true),
+            () => _quickGateway!.deleteEntry(messagePath, recursive: true),
           );
         } catch (exception, stackTrace) {
           var stillExists = true;
           try {
             final packages = await _retryOperation(
-              () => _gateway!.listDirectory('$_quickRoot/$_quickMessages'),
+              () => _quickGateway!.listDirectory('$_quickRoot/$_quickMessages'),
             );
             stillExists = packages.any(
               (entry) => entry.isDirectory && entry.name == manifest.id,
@@ -3406,7 +3663,11 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _resetConnection() async {
-    if (mode == RepositoryMode.sftp) await _gateway?.dispose();
+    if (mode == RepositoryMode.sftp) {
+      await _gateway?.dispose();
+    } else if (mode == RepositoryMode.macSync) {
+      await _syncGateway?.dispose();
+    }
   }
 
   Future<T> _retryOperation<T>(Future<T> Function() operation) async {
@@ -3467,13 +3728,41 @@ class AppController extends ChangeNotifier {
     return total;
   }
 
-  Future<void> _ensureRemoteSpace(int requiredBytes, String path) async {
+  Future<void> _ensureRemoteSpace(
+    int requiredBytes,
+    String path, {
+    RepositoryGateway? gateway,
+  }) async {
+    final targetGateway = gateway ?? _gateway;
+    if (targetGateway == null) {
+      throw StateError('Repository is not connected.');
+    }
     final available = await _retryOperation(
-      () => _gateway!.availableBytes(path),
+      () => targetGateway.availableBytes(path),
     );
     const reserve = 16 * 1024 * 1024;
     if (available != null && available < requiredBytes + reserve) {
       throw StateError('The destination does not have enough free space.');
+    }
+  }
+
+  Future<void> _invalidateCentralSyncManifest() async {
+    if (mode == RepositoryMode.macSync) {
+      syncStatus = RepositorySyncStatus.changed;
+      syncStatusMessage = '本地副本有尚未推送的变更';
+      syncConflicts = const [];
+      notifyListeners();
+      return;
+    }
+    final gateway = _gateway;
+    if (gateway is RepositorySyncManifestInvalidator) {
+      try {
+        await (gateway as RepositorySyncManifestInvalidator)
+            .invalidateRepositorySyncManifest();
+      } catch (_) {
+        // The manifest is only an accelerator; a failed invalidation must not
+        // turn a successful ordinary repository mutation into a failed task.
+      }
     }
   }
 
@@ -3579,6 +3868,7 @@ class AppController extends ChangeNotifier {
     unawaited(_photoTransferClient.dispose());
     unawaited(_directTransferClient.dispose());
     _gateway?.dispose();
+    _syncGateway?.dispose();
     super.dispose();
   }
 }

@@ -7,14 +7,35 @@ import FlutterMacOS
 final class SecurityScopedBookmarkStore {
   static let shared = SecurityScopedBookmarkStore()
 
-  private static let bookmarkKey = "jet2drop.macos.quickSaveDirectoryBookmark"
-  private var activeURL: URL?
+  private static let quickSaveBookmarkKey =
+    "jet2drop.macos.quickSaveDirectoryBookmark"
+  private static let syncRootBookmarkKey =
+    "jet2drop.macos.syncRootDirectoryBookmark"
+  private var activeQuickSaveURL: URL?
+  private var activeSyncRootURL: URL?
 
   private init() {}
 
   func restoreDirectoryAccess() -> String? {
+    restore(
+      bookmarkKey: Self.quickSaveBookmarkKey,
+      activeURL: &activeQuickSaveURL
+    )
+  }
+
+  func restoreSyncDirectoryAccess() -> String? {
+    restore(
+      bookmarkKey: Self.syncRootBookmarkKey,
+      activeURL: &activeSyncRootURL
+    )
+  }
+
+  private func restore(
+    bookmarkKey: String,
+    activeURL: inout URL?
+  ) -> String? {
     guard activeURL == nil else { return activeURL?.path }
-    guard let data = UserDefaults.standard.data(forKey: Self.bookmarkKey) else {
+    guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else {
       return nil
     }
 
@@ -28,7 +49,7 @@ final class SecurityScopedBookmarkStore {
       )
       guard url.isFileURL, isDirectory(url),
             url.startAccessingSecurityScopedResource() else {
-        UserDefaults.standard.removeObject(forKey: Self.bookmarkKey)
+        UserDefaults.standard.removeObject(forKey: bookmarkKey)
         return nil
       }
 
@@ -39,24 +60,47 @@ final class SecurityScopedBookmarkStore {
           includingResourceValuesForKeys: nil,
           relativeTo: nil
         )
-        UserDefaults.standard.set(refreshed, forKey: Self.bookmarkKey)
+        UserDefaults.standard.set(refreshed, forKey: bookmarkKey)
       }
       return url.path
     } catch {
       activeURL?.stopAccessingSecurityScopedResource()
       activeURL = nil
-      UserDefaults.standard.removeObject(forKey: Self.bookmarkKey)
+      UserDefaults.standard.removeObject(forKey: bookmarkKey)
       return nil
     }
   }
 
   func persistDirectoryAccess(path: String) throws {
+    try persist(
+      path: path,
+      bookmarkKey: Self.quickSaveBookmarkKey,
+      activeURL: &activeQuickSaveURL,
+      invalidMessage: "默认保存位置必须是文件夹。"
+    )
+  }
+
+  func persistSyncDirectoryAccess(path: String) throws {
+    try persist(
+      path: path,
+      bookmarkKey: Self.syncRootBookmarkKey,
+      activeURL: &activeSyncRootURL,
+      invalidMessage: "本地副本位置必须是文件夹。"
+    )
+  }
+
+  private func persist(
+    path: String,
+    bookmarkKey: String,
+    activeURL: inout URL?,
+    invalidMessage: String
+  ) throws {
     let url = URL(fileURLWithPath: path, isDirectory: true)
     guard url.isFileURL, isDirectory(url) else {
       throw NSError(
         domain: "Jet2Drop.SecurityScopedBookmark",
         code: 1,
-        userInfo: [NSLocalizedDescriptionKey: "默认保存位置必须是文件夹。"]
+        userInfo: [NSLocalizedDescriptionKey: invalidMessage]
       )
     }
 
@@ -66,7 +110,7 @@ final class SecurityScopedBookmarkStore {
         includingResourceValuesForKeys: nil,
         relativeTo: nil
       )
-      UserDefaults.standard.set(bookmark, forKey: Self.bookmarkKey)
+      UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
       return
     }
 
@@ -74,7 +118,7 @@ final class SecurityScopedBookmarkStore {
       throw NSError(
         domain: "Jet2Drop.SecurityScopedBookmark",
         code: 2,
-        userInfo: [NSLocalizedDescriptionKey: "无法取得默认保存目录的访问权限。"]
+        userInfo: [NSLocalizedDescriptionKey: "无法取得所选目录的访问权限。"]
       )
     }
 
@@ -84,7 +128,7 @@ final class SecurityScopedBookmarkStore {
         includingResourceValuesForKeys: nil,
         relativeTo: nil
       )
-      UserDefaults.standard.set(bookmark, forKey: Self.bookmarkKey)
+      UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
       let previous = activeURL
       activeURL = url
       previous?.stopAccessingSecurityScopedResource()
@@ -95,8 +139,10 @@ final class SecurityScopedBookmarkStore {
   }
 
   func releaseDirectoryAccess() {
-    activeURL?.stopAccessingSecurityScopedResource()
-    activeURL = nil
+    activeQuickSaveURL?.stopAccessingSecurityScopedResource()
+    activeQuickSaveURL = nil
+    activeSyncRootURL?.stopAccessingSecurityScopedResource()
+    activeSyncRootURL = nil
   }
 
   private func isDirectory(_ url: URL) -> Bool {

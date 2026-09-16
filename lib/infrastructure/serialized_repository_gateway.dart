@@ -5,7 +5,11 @@ import '../core/repository_gateway.dart';
 import '../core/transfer_control.dart';
 
 /// Serializes requests sent through one stateful repository connection.
-class SerializedRepositoryGateway implements RepositoryGateway {
+class SerializedRepositoryGateway
+    implements
+        RepositoryGateway,
+        AtomicRepositoryGateway,
+        RepositorySyncManifestInvalidator {
   SerializedRepositoryGateway(this._delegate);
 
   final RepositoryGateway _delegate;
@@ -39,6 +43,39 @@ class SerializedRepositoryGateway implements RepositoryGateway {
   @override
   Future<void> deleteEntry(String relativePath, {required bool recursive}) =>
       _run(() => _delegate.deleteEntry(relativePath, recursive: recursive));
+
+  @override
+  Future<void> invalidateRepositorySyncManifest() {
+    final invalidator = _delegate;
+    if (invalidator is RepositorySyncManifestInvalidator) {
+      return _run(
+        () => (invalidator as RepositorySyncManifestInvalidator)
+            .invalidateRepositorySyncManifest(),
+      );
+    }
+    return Future<void>.value();
+  }
+
+  @override
+  Future<void> moveEntry(
+    String sourcePath,
+    String targetPath, {
+    bool overwrite = false,
+  }) {
+    final atomic = _delegate;
+    if (atomic is AtomicRepositoryGateway) {
+      return _run(
+        () => (atomic as AtomicRepositoryGateway).moveEntry(
+          sourcePath,
+          targetPath,
+          overwrite: overwrite,
+        ),
+      );
+    }
+    throw UnsupportedError(
+      'Repository synchronization requires an atomic move capability.',
+    );
+  }
 
   @override
   Future<void> uploadFile({

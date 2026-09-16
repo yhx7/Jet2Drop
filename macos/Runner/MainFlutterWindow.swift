@@ -124,6 +124,8 @@ class MainFlutterWindow: NSWindow {
       switch call.method {
       case "restoreDirectoryAccess":
         result(SecurityScopedBookmarkStore.shared.restoreDirectoryAccess())
+      case "restoreSyncDirectoryAccess":
+        result(SecurityScopedBookmarkStore.shared.restoreSyncDirectoryAccess())
       case "persistDirectoryAccess":
         guard let arguments = call.arguments as? [String: Any],
               let path = arguments["path"] as? String,
@@ -139,6 +141,33 @@ class MainFlutterWindow: NSWindow {
         }
         do {
           try SecurityScopedBookmarkStore.shared.persistDirectoryAccess(
+            path: path
+          )
+          result(nil)
+        } catch {
+          result(
+            FlutterError(
+              code: "security_scope_error",
+              message: error.localizedDescription,
+              details: nil
+            )
+          )
+        }
+      case "persistSyncDirectoryAccess":
+        guard let arguments = call.arguments as? [String: Any],
+              let path = arguments["path"] as? String,
+              !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+          result(
+            FlutterError(
+              code: "invalid_arguments",
+              message: "目录路径不能为空。",
+              details: nil
+            )
+          )
+          return
+        }
+        do {
+          try SecurityScopedBookmarkStore.shared.persistSyncDirectoryAccess(
             path: path
           )
           result(nil)

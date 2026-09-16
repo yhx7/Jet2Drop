@@ -6,6 +6,25 @@ import 'transfer_control.dart';
 typedef ProgressCallback = void Function(int transferred, int total);
 typedef ChecksumCallback = void Function(String checksum);
 
+/// Optional capability used by repository synchronization to publish a
+/// staged entry with one server-side rename. Keeping this separate from the
+/// browsing/transfer interface preserves compatibility with older gateway
+/// implementations used by integrations and tests.
+abstract interface class AtomicRepositoryGateway {
+  Future<void> moveEntry(
+    String sourcePath,
+    String targetPath, {
+    bool overwrite = false,
+  });
+}
+
+/// Optional capability for a central-repository gateway. Ordinary Jet2Drop
+/// mutations can invalidate the sync accelerator without forcing a full scan
+/// and re-hash on every upload; the synchronizer still scans formal files.
+abstract interface class RepositorySyncManifestInvalidator {
+  Future<void> invalidateRepositorySyncManifest();
+}
+
 abstract interface class RepositoryGateway {
   Future<void> initialize();
   Future<int?> availableBytes(String relativePath);
@@ -13,6 +32,7 @@ abstract interface class RepositoryGateway {
   Future<List<FileEntry>> listDirectory(String relativePath);
   Future<void> createDirectory(String relativePath, String name);
   Future<void> deleteEntry(String relativePath, {required bool recursive});
+
   Future<void> uploadFile({
     required File source,
     required String targetDirectory,

@@ -12,6 +12,7 @@ import 'core/models/file_entry.dart';
 import 'core/models/quick_device.dart';
 import 'core/models/transfer_task.dart';
 import 'core/path_utils.dart';
+import 'core/repository_sync.dart';
 import 'core/photo_transfer.dart';
 import 'core/quick_transfer.dart';
 import 'core/transfer_control.dart';
@@ -257,6 +258,7 @@ class _RepositoryPageState extends State<RepositoryPage>
     return Column(
       children: [
         _responsiveToolbar(),
+        if (controller.isMacRepositoryMirror) _syncToolbar(),
         _breadcrumbs(),
         if (controller.error != null)
           MaterialBanner(
@@ -386,6 +388,7 @@ class _RepositoryPageState extends State<RepositoryPage>
   Widget _responsiveToolbar() => LayoutBuilder(
     builder: (context, constraints) {
       final compact = constraints.maxWidth < 560;
+      final syncBusy = controller.isSyncInProgress;
       final navigation = Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -396,7 +399,7 @@ class _RepositoryPageState extends State<RepositoryPage>
           ),
           IconButton(
             tooltip: '刷新',
-            onPressed: controller.refresh,
+            onPressed: syncBusy ? null : controller.refresh,
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -407,12 +410,12 @@ class _RepositoryPageState extends State<RepositoryPage>
         runSpacing: 4,
         children: [
           FilledButton.icon(
-            onPressed: _pickUpload,
+            onPressed: syncBusy ? null : _pickUpload,
             icon: const Icon(Icons.upload_file),
             label: const Text('上传'),
           ),
           OutlinedButton.icon(
-            onPressed: _createFolder,
+            onPressed: syncBusy ? null : _createFolder,
             icon: const Icon(Icons.create_new_folder_outlined),
             label: const Text('新建文件夹'),
           ),
@@ -466,6 +469,97 @@ class _RepositoryPageState extends State<RepositoryPage>
     },
   );
 
+  Widget _syncToolbar() {
+    final busy =
+        controller.syncStatus == RepositorySyncStatus.syncing ||
+        controller.isLoading ||
+        controller.hasActiveTransfers;
+    final status = switch (controller.syncStatus) {
+      RepositorySyncStatus.synced => ('已同步', Colors.green, Icons.cloud_done),
+      RepositorySyncStatus.changed => (
+        '有变更',
+        Colors.orange,
+        Icons.sync_problem_outlined,
+      ),
+      RepositorySyncStatus.syncing => (
+        '同步中',
+        Colors.orange,
+        Icons.sync_outlined,
+      ),
+      RepositorySyncStatus.needsAttention => (
+        '需处理',
+        Colors.red,
+        Icons.warning_amber_outlined,
+      ),
+    };
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        runSpacing: 6,
+        children: [
+          Icon(status.$3, size: 18, color: status.$2),
+          Text(status.$1, style: TextStyle(color: status.$2)),
+          Text(
+            controller.syncStatusMessage,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(width: 4),
+          OutlinedButton.icon(
+            onPressed: busy
+                ? null
+                : () async {
+                    try {
+                      await controller.pullRepositoryUpdates();
+                    } catch (exception) {
+                      if (mounted) {
+                        _message(controller.describeError(exception));
+                      }
+                    }
+                  },
+            icon: const Icon(Icons.download_outlined),
+            label: const Text('拉取更新'),
+          ),
+          FilledButton.icon(
+            onPressed: busy
+                ? null
+                : () async {
+                    try {
+                      await controller.pushRepositoryUpdates();
+                    } catch (exception) {
+                      if (mounted) {
+                        _message(controller.describeError(exception));
+                      }
+                    }
+                  },
+            icon: const Icon(Icons.upload_outlined),
+            label: const Text('推送更新'),
+          ),
+          if (controller.syncConflicts.isNotEmpty)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '冲突 ${controller.syncConflicts.length} 项',
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+                for (final conflict in controller.syncConflicts.take(4))
+                  Text(
+                    '${conflict.path}：${conflict.description}',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                      fontSize: 12,
+                    ),
+                  ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _breadcrumbs() {
     final parts = controller.currentPath.isEmpty
         ? const <String>[]
@@ -476,7 +570,13 @@ class _RepositoryPageState extends State<RepositoryPage>
         children: [
           const Icon(Icons.storage_outlined, size: 18),
           const SizedBox(width: 6),
-          Text(controller.mode == RepositoryMode.local ? 'Repository' : '远程仓库'),
+          Text(
+            controller.isMacRepositoryMirror
+                ? 'Mac 本地副本'
+                : controller.mode == RepositoryMode.local
+                ? 'Repository'
+                : '远程仓库',
+          ),
           for (var index = 0; index < parts.length; index++) ...[
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 5),
@@ -1667,12 +1767,17 @@ class _RepositoryPageState extends State<RepositoryPage>
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   SegmentedButton<RepositoryMode>(
-                    segments: const [
-                      ButtonSegment(
+                    segments: [
+                      const ButtonSegment(
                         value: RepositoryMode.local,
                         label: Text('本地仓库'),
                       ),
-                      ButtonSegment(
+                      if (Platform.isMacOS)
+                        const ButtonSegment(
+                          value: RepositoryMode.macSync,
+                          label: Text('Mac 本地副本'),
+                        ),
+                      const ButtonSegment(
                         value: RepositoryMode.sftp,
                         label: Text('SFTPGo'),
                       ),
@@ -1690,7 +1795,32 @@ class _RepositoryPageState extends State<RepositoryPage>
                         hintText: r'E:\Repository',
                       ),
                     ),
-                  if (selectedMode == RepositoryMode.sftp) ...[
+                  if (selectedMode == RepositoryMode.macSync) ...[
+                    TextField(
+                      controller: local,
+                      decoration: const InputDecoration(
+                        labelText: '本地副本目录',
+                        hintText: '选择一个用于离线浏览和修改的文件夹',
+                      ),
+                    ),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          final path = await getDirectoryPath();
+                          if (path != null && context.mounted) {
+                            local.text = path;
+                            setDialogState(() {});
+                          }
+                        },
+                        icon: const Icon(Icons.folder_open_outlined),
+                        label: const Text('选择本地副本目录'),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  if (selectedMode == RepositoryMode.sftp ||
+                      selectedMode == RepositoryMode.macSync) ...[
                     TextField(
                       controller: host,
                       decoration: const InputDecoration(
@@ -1796,6 +1926,17 @@ class _RepositoryPageState extends State<RepositoryPage>
       }
       if (selectedMode == RepositoryMode.local) {
         await controller.configureLocalRoot(local.text.trim());
+      } else if (selectedMode == RepositoryMode.macSync) {
+        await controller.configureMacSync(
+          path: local.text.trim(),
+          profile: SftpConnectionProfile(
+            host: host.text.trim(),
+            port: int.tryParse(port.text.trim()) ?? 2022,
+            username: username.text.trim(),
+            password: password.text,
+            hostKeyFingerprint: fingerprint.text.trim(),
+          ),
+        );
       } else {
         await controller.configureSftp(
           SftpConnectionProfile(

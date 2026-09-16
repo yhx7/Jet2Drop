@@ -27,7 +27,11 @@ class SftpConnectionProfile {
   final String hostKeyFingerprint;
 }
 
-class SftpRepositoryGateway implements RepositoryGateway {
+class SftpRepositoryGateway
+    implements
+        RepositoryGateway,
+        AtomicRepositoryGateway,
+        RepositorySyncManifestInvalidator {
   SftpRepositoryGateway(this.profile, this.cacheDirectory);
 
   final SftpConnectionProfile profile;
@@ -164,6 +168,7 @@ class SftpRepositoryGateway implements RepositoryGateway {
     );
     final entries = names
         .where((item) => item.filename != '.' && item.filename != '..')
+        .where((item) => item.filename != '__jet2drop_sync')
         .where((item) => item.filename != '__jet2drop_transfer')
         .where((item) => !item.filename.startsWith('.jet2drop-'))
         .where((item) => !item.filename.contains('.jet2drop-upload-'))
@@ -221,6 +226,68 @@ class SftpRepositoryGateway implements RepositoryGateway {
       await _deleteDirectoryRecursively(sftp, remotePath);
     } else {
       await sftp.rmdir(remotePath);
+    }
+  }
+
+  @override
+  Future<void> invalidateRepositorySyncManifest() async {
+    final sftp = await _connection;
+    try {
+      await sftp.remove(_remote('__jet2drop_sync/manifest.json'));
+    } catch (_) {
+      // An absent accelerator is already the desired invalidated state.
+    }
+  }
+
+  @override
+  Future<void> moveEntry(
+    String sourcePath,
+    String targetPath, {
+    bool overwrite = false,
+  }) async {
+    final sftp = await _connection;
+    final source = _remote(sourcePath);
+    final target = _remote(targetPath);
+    var destinationExists = false;
+    var destinationIsDirectory = false;
+    try {
+      final targetStat = await sftp.stat(target);
+      destinationExists = true;
+      destinationIsDirectory = targetStat.mode?.type == SftpFileType.directory;
+    } catch (_) {}
+    if (destinationExists && !overwrite) {
+      throw FileSystemException('A file with the same name already exists.');
+    }
+    final backup = '$target.jet2drop-backup-${uniqueSuffix()}';
+    if (destinationExists) {
+      await _withOperationTimeout(
+        sftp.rename(target, backup),
+        'Preparing move',
+      );
+    }
+    try {
+      await _withOperationTimeout(
+        sftp.rename(source, target),
+        'Publishing move',
+      );
+    } catch (_) {
+      if (destinationExists) {
+        try {
+          await _withOperationTimeout(
+            sftp.rename(backup, target),
+            'Restoring moved file',
+          );
+        } catch (_) {}
+      }
+      rethrow;
+    }
+    if (destinationExists) {
+      try {
+        await _withOperationTimeout(
+          destinationIsDirectory ? sftp.rmdir(backup) : sftp.remove(backup),
+          'Cleaning moved backup',
+        );
+      } catch (_) {}
     }
   }
 
