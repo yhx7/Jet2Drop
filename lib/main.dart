@@ -758,18 +758,89 @@ class _RepositoryPageState extends State<RepositoryPage>
                       const SizedBox(height: 16),
                       _quickModeSelector(selectedDevice),
                       const SizedBox(height: 16),
-                      FilledButton.icon(
-                        onPressed: selected == null
-                            ? null
-                            : () => _pickQuickFiles(
-                                selected,
-                                requestedMode: _effectiveQuickTransferMode(
-                                  selectedDevice,
+                      if (Platform.isAndroid)
+                        compact
+                            ? Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  FilledButton.icon(
+                                    onPressed: selected == null
+                                        ? null
+                                        : () => _pickQuickMedia(
+                                            selected,
+                                            requestedMode:
+                                                _effectiveQuickTransferMode(
+                                                  selectedDevice,
+                                                ),
+                                          ),
+                                    icon: const Icon(Icons.perm_media_outlined),
+                                    label: const Text('传图片或视频'),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  OutlinedButton.icon(
+                                    onPressed: selected == null
+                                        ? null
+                                        : () => _pickQuickFiles(
+                                            selected,
+                                            requestedMode:
+                                                _effectiveQuickTransferMode(
+                                                  selectedDevice,
+                                                ),
+                                          ),
+                                    icon: const Icon(
+                                      Icons.attach_file_outlined,
+                                    ),
+                                    label: const Text('传其他文件'),
+                                  ),
+                                ],
+                              )
+                            : Wrap(
+                                spacing: 12,
+                                runSpacing: 12,
+                                children: [
+                                  FilledButton.icon(
+                                    onPressed: selected == null
+                                        ? null
+                                        : () => _pickQuickMedia(
+                                            selected,
+                                            requestedMode:
+                                                _effectiveQuickTransferMode(
+                                                  selectedDevice,
+                                                ),
+                                          ),
+                                    icon: const Icon(Icons.perm_media_outlined),
+                                    label: const Text('传图片或视频'),
+                                  ),
+                                  OutlinedButton.icon(
+                                    onPressed: selected == null
+                                        ? null
+                                        : () => _pickQuickFiles(
+                                            selected,
+                                            requestedMode:
+                                                _effectiveQuickTransferMode(
+                                                  selectedDevice,
+                                                ),
+                                          ),
+                                    icon: const Icon(
+                                      Icons.attach_file_outlined,
+                                    ),
+                                    label: const Text('传其他文件'),
+                                  ),
+                                ],
+                              )
+                      else
+                        FilledButton.icon(
+                          onPressed: selected == null
+                              ? null
+                              : () => _pickQuickFiles(
+                                  selected,
+                                  requestedMode: _effectiveQuickTransferMode(
+                                    selectedDevice,
+                                  ),
                                 ),
-                              ),
-                        icon: const Icon(Icons.attach_file_outlined),
-                        label: const Text('选择文件'),
-                      ),
+                          icon: const Icon(Icons.attach_file_outlined),
+                          label: const Text('选择文件'),
+                        ),
                     ],
                   ),
                 ),
@@ -1013,10 +1084,10 @@ class _RepositoryPageState extends State<RepositoryPage>
     }
   }
 
-  // Kept for callers/tests that still exercise the legacy photo picker. The
-  // visible quick-transfer UI now uses the generic file picker and mode row.
-  // ignore: unused_element
-  Future<void> _pickQuickMedia(String targetDevice) async {
+  Future<void> _pickQuickMedia(
+    String targetDevice, {
+    QuickTransferMode? requestedMode,
+  }) async {
     final selections = <_QuickFileSelection>[];
     if (Platform.isAndroid) {
       selections.addAll(
@@ -1045,6 +1116,7 @@ class _RepositoryPageState extends State<RepositoryPage>
       await _sendQuickFiles(
         files,
         targetDevice: targetDevice,
+        requestedMode: requestedMode,
         allowPhotoDirect: true,
         metadata: {
           for (final selection in selections) selection.file.path: selection,
