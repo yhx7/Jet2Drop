@@ -89,8 +89,11 @@ class AppController extends ChangeNotifier {
   static const _pendingTransfersKey = 'pending_transfers_v1';
   static const _quickRoot = '__jet2drop_transfer';
   static const _quickMessages = 'messages';
-  static const quickTransferActiveRefreshInterval = Duration(seconds: 15);
-  static const quickTransferInactiveRefreshInterval = Duration(seconds: 45);
+  // Poll intervals for the relay inbox. The local repository watcher refreshes
+  // as soon as a package lands, so these only cover ways of receiving that
+  // cannot be observed directly (an SFTP repository, which has no push).
+  static const quickTransferActiveRefreshInterval = Duration(seconds: 5);
+  static const quickTransferInactiveRefreshInterval = Duration(seconds: 20);
 
   /// Fixed high port used by the desktop direct receiver so registrations do
   /// not change every time the app restarts.
@@ -175,6 +178,8 @@ class AppController extends ChangeNotifier {
   Timer? _quickMaintenanceTimer;
   Future<void>? _directServerStartFuture;
   Future<void>? _quickBackgroundWork;
+  StreamSubscription<void>? _quickChangeWatch;
+  Timer? _quickChangeDebounce;
   bool _quickMaintenanceInProgress = false;
   bool _quickTransferPageActive = false;
   DateTime? _lastQuickPresenceUpdate;
@@ -1140,6 +1145,7 @@ class AppController extends ChangeNotifier {
       // reconnect spinner open while quick-transfer metadata is prepared.
       notifyListeners();
       if (mode == RepositoryMode.macSync) unawaited(_refreshSyncSnapshot());
+      _watchQuickRepositoryChanges();
       _trackQuickBackground(_initializeQuickTransferSafely);
     } catch (exception) {
       error = describeError(exception);
@@ -3878,6 +3884,29 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  /// Refreshes the relay inbox as soon as the repository changes on disk.
+  ///
+  /// Polling alone means a package that lands just after a tick waits up to a
+  /// whole interval before the recipient can see it. Gateways that cannot
+  /// report changes (an SFTP repository) keep polling.
+  void _watchQuickRepositoryChanges() {
+    unawaited(_quickChangeWatch?.cancel());
+    _quickChangeWatch = null;
+    _quickChangeDebounce?.cancel();
+    _quickChangeDebounce = null;
+    final gateway = _quickGateway;
+    if (gateway == null) return;
+    if (gateway is! RepositoryChangeSource) return;
+    final changes = (gateway as RepositoryChangeSource).repositoryChanges;
+    _quickChangeWatch = changes.listen((_) {
+      _quickChangeDebounce?.cancel();
+      _quickChangeDebounce = Timer(const Duration(milliseconds: 250), () {
+        if (_disposed || _quickGateway == null) return;
+        unawaited(refreshQuickTransfer());
+      });
+    });
+  }
+
   Future<void> _recoverTemporaryFiles(String path) async {
     try {
       await _gateway?.recoverTemporaryFiles(path);
@@ -4014,6 +4043,10 @@ class AppController extends ChangeNotifier {
     _quickRefreshGeneration++;
     _quickMaintenanceTimer?.cancel();
     _transferUiTimer?.cancel();
+    _quickChangeDebounce?.cancel();
+    _quickChangeDebounce = null;
+    unawaited(_quickChangeWatch?.cancel());
+    _quickChangeWatch = null;
     // Stop in-flight transfers as well: their writers keep touching the
     // repository until the next checkpoint, and a caller may delete that
     // repository as soon as dispose returns.

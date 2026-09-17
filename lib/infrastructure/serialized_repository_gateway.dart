@@ -9,11 +9,22 @@ class SerializedRepositoryGateway
     implements
         RepositoryGateway,
         AtomicRepositoryGateway,
-        RepositorySyncManifestInvalidator {
+        RepositorySyncManifestInvalidator,
+        RepositoryChangeSource {
   SerializedRepositoryGateway(this._delegate);
 
   final RepositoryGateway _delegate;
   Future<void> _tail = Future<void>.value();
+
+  /// Forwards the delegate's external change stream, or an empty stream when
+  /// the delegate cannot observe changes.
+  @override
+  Stream<void> get repositoryChanges {
+    final delegate = _delegate;
+    return delegate is RepositoryChangeSource
+        ? (delegate as RepositoryChangeSource).repositoryChanges
+        : const Stream<void>.empty();
+  }
 
   Future<T> _run<T>(Future<T> Function() operation) {
     final result = _tail.then((_) => operation());

@@ -28,7 +28,10 @@ void main() {
       AppController.quickTransferActiveRefreshInterval,
     );
     expect(timers, hasLength(1));
-    expect(timers.single.duration, const Duration(seconds: 15));
+    expect(
+      timers.single.duration,
+      AppController.quickTransferActiveRefreshInterval,
+    );
     expect(timers.single.isActive, isTrue);
 
     // Repeating the same navigation state must not restart or duplicate the
@@ -44,7 +47,10 @@ void main() {
     );
     expect(timers, hasLength(2));
     expect(timers.first.isActive, isFalse);
-    expect(timers.last.duration, const Duration(seconds: 45));
+    expect(
+      timers.last.duration,
+      AppController.quickTransferInactiveRefreshInterval,
+    );
     expect(timers.last.isActive, isTrue);
 
     controller.setQuickTransferPageActive(false);

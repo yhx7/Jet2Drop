@@ -11,13 +11,18 @@ class LocalRepositoryGateway
     implements
         RepositoryGateway,
         AtomicRepositoryGateway,
-        RepositorySyncManifestInvalidator {
+        RepositorySyncManifestInvalidator,
+        RepositoryChangeSource {
   LocalRepositoryGateway(this.rootPath);
 
   final String rootPath;
   StreamSubscription<FileSystemEvent>? _repositoryWatch;
+  final StreamController<void> _changes = StreamController<void>.broadcast();
 
   Directory get _root => Directory(rootPath);
+
+  @override
+  Stream<void> get repositoryChanges => _changes.stream;
 
   @override
   Future<void> initialize() async {
@@ -26,6 +31,7 @@ class LocalRepositoryGateway
     await invalidateRepositorySyncManifest();
     try {
       _repositoryWatch = _root.watch(recursive: true).listen((event) {
+        if (_isRelayEvent(event.path)) _notifyChange();
         if (_isInternalEvent(event.path)) return;
         unawaited(invalidateRepositorySyncManifest());
       });
@@ -33,6 +39,16 @@ class LocalRepositoryGateway
       // Ordinary Jet2Drop writes still invalidate explicitly. Startup also
       // invalidates, so a missing watcher only postpones external detection.
     }
+  }
+
+  /// Whether [path] belongs to the relay message store, whose arrivals must be
+  /// visible without waiting for a polling tick.
+  bool _isRelayEvent(String path) =>
+      path.replaceAll('\\', '/').contains('/__jet2drop_transfer/');
+
+  void _notifyChange() {
+    if (_changes.isClosed) return;
+    _changes.add(null);
   }
 
   bool _isInternalEvent(String path) {
@@ -424,5 +440,6 @@ class LocalRepositoryGateway
   Future<void> dispose() async {
     await _repositoryWatch?.cancel();
     _repositoryWatch = null;
+    await _changes.close();
   }
 }

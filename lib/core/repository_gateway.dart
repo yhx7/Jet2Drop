@@ -25,6 +25,17 @@ abstract interface class RepositorySyncManifestInvalidator {
   Future<void> invalidateRepositorySyncManifest();
 }
 
+/// Optional capability for gateways that observe changes made to the
+/// repository outside the app.
+///
+/// The local repository watcher publishes them so a relay package that lands on
+/// disk is noticed immediately instead of waiting for the next polling tick.
+/// Gateways without a watcher simply do not implement this.
+abstract interface class RepositoryChangeSource {
+  /// Emits once per externally observed change, without payload details.
+  Stream<void> get repositoryChanges;
+}
+
 abstract interface class RepositoryGateway {
   Future<void> initialize();
   Future<int?> availableBytes(String relativePath);
