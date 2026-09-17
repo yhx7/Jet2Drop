@@ -53,6 +53,31 @@ class SftpRepositoryGateway
   // in-flight window through the request pipeline.
   static const _downloadChunkSize = 32 * 1024;
   static const _downloadPendingRequests = 128;
+  // Uploads use the same 32 KiB packet size for the same server-side reason:
+  // SFTPGo may legally answer a 64 KiB request with a short packet. With 128
+  // outstanding write requests the in-flight window is roughly 4 MiB instead
+  // of the 16 KiB/64-request default's 1 MiB. Progress still comes from the
+  // acknowledged byte count, so it can never run ahead of the server.
+  static const _uploadChunkSize = 32 * 1024;
+  static const _uploadPendingRequests = 128;
+
+  /// Cipher preference for the SSH session.
+  ///
+  /// dartssh2 4.1.0 negotiates AES-GCM by default and its pure-Dart GCM runs at
+  /// roughly 1 MiB/s here, which made every upload and download about 15x
+  /// slower than with 2.22.5 (measured against SFTPGo: 4 MiB in ~3.9 s versus
+  /// ~0.24 s). ChaCha20-Poly1305 and AES-CTR both reach ~16-17 MiB/s, so the
+  /// AEAD suite is preferred and GCM/CTR stay as fallbacks for peers that do
+  /// not offer it.
+  static const _algorithms = SSHAlgorithms(
+    cipher: <SSHCipherType>[
+      SSHCipherType.chacha20poly1305,
+      SSHCipherType.aes256gcm,
+      SSHCipherType.aes128gcm,
+      SSHCipherType.aes256ctr,
+      SSHCipherType.aes128ctr,
+    ],
+  );
 
   Future<T> _withOperationTimeout<T>(Future<T> operation, String action) =>
       operation.timeout(
@@ -74,7 +99,23 @@ class SftpRepositoryGateway
     final client = _client;
     _sftp = null;
     _client = null;
-    client?.close();
+    // dartssh2 4.1.0 closes the transport asynchronously. The timeout paths
+    // cannot wait for it without delaying the failure they report, so the
+    // future is observed here instead of escaping as an unhandled error.
+    unawaited(_closeClient(client));
+  }
+
+  /// Closes one SSH connection and swallows teardown errors.
+  ///
+  /// [SSHClient.close] returns a [Future] in dartssh2 4.1.0, so callers that
+  /// can afford to wait use this to keep the release order deterministic.
+  Future<void> _closeClient(SSHClient? client) async {
+    if (client == null) return;
+    try {
+      await client.close();
+    } catch (_) {
+      // The connection is already unusable; there is nothing left to release.
+    }
   }
 
   Future<SftpClient> get _connection async {
@@ -92,6 +133,7 @@ class SftpRepositoryGateway
         final actual = utf8.decode(fingerprint, allowMalformed: true);
         return actual == profile.hostKeyFingerprint;
       },
+      algorithms: _algorithms,
     );
     _client = client;
     try {
@@ -101,7 +143,9 @@ class SftpRepositoryGateway
       );
       return _sftp!;
     } catch (exception) {
-      client.close();
+      // Await the async close so a failed handshake cannot leave a half-open
+      // socket behind before the caller retries.
+      await _closeClient(client);
       _client = null;
       rethrow;
     }
@@ -398,7 +442,18 @@ class SftpRepositoryGateway
 
       final writer = handle.write(
         source.openRead(offset).asyncExpand((chunk) async* {
-          await control?.checkpoint();
+          try {
+            await control?.checkpoint();
+          } on TransferDeferred {
+            // dartssh2 4.1.0 completes the writer before the source stream is
+            // torn down, so an exception thrown here after a pause/cancel has
+            // no listener left and would surface as an unhandled async error.
+            // Ending the stream cleanly keeps the deferral reporting where it
+            // belongs: the checkpoint after [writer.done] below.
+            return;
+          } on TransferCancelled {
+            return;
+          }
           checksum?.add(chunk);
           yield chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
         }),
@@ -407,6 +462,8 @@ class SftpRepositoryGateway
           onProgress?.call(offset + value, total);
         },
         offset: offset,
+        chunkSize: _uploadChunkSize,
+        maxPendingRequests: _uploadPendingRequests,
       );
       onProgress?.call(offset, total);
       resetInactivityTimer();
@@ -626,8 +683,9 @@ class SftpRepositoryGateway
 
   @override
   Future<void> dispose() async {
-    _client?.close();
+    final client = _client;
     _client = null;
     _sftp = null;
+    await _closeClient(client);
   }
 }

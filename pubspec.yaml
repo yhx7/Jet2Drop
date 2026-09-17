@@ -32,7 +32,7 @@ dependencies:
     sdk: flutter
 
   crypto: ^3.0.7
-  dartssh2: 2.22.5
+  dartssh2: 4.1.0
   desktop_drop: 0.7.1
   file_selector: 1.1.0
   flutter_secure_storage: 10.3.1
