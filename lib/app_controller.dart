@@ -675,11 +675,9 @@ class AppController extends ChangeNotifier {
             saveTarget: saver,
           );
           _cleanupActions[id] = () async {
-            final support = await getApplicationSupportDirectory();
-            final staging = Directory(
-              '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
+            await _discardQuickStaging(
+              _quickReceiveStaging(target, manifest.id),
             );
-            if (await staging.exists()) await staging.delete(recursive: true);
             _reservedQuickReceivePaths.remove(target.path.toLowerCase());
             if (!_quickLocallySaved.contains(id) && await target.exists()) {
               await target.delete();
@@ -3366,11 +3364,7 @@ class AppController extends ChangeNotifier {
       saveTarget: targetSaver,
     );
     _cleanupActions[task.id] = () async {
-      final support = await getApplicationSupportDirectory();
-      final staging = Directory(
-        '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
-      );
-      if (await staging.exists()) await staging.delete(recursive: true);
+      await _discardQuickStaging(_quickReceiveStaging(target, manifest.id));
       _reservedQuickReceivePaths.remove(target.path.toLowerCase());
       if (!_quickLocallySaved.contains(task.id) && await target.exists()) {
         await target.delete();
@@ -3424,6 +3418,34 @@ class AppController extends ChangeNotifier {
     if (await file.exists()) await file.delete();
   }
 
+  /// Staging directory for one relay claim.
+  ///
+  /// It sits next to the file's final location so that publishing the claim is
+  /// a same-volume atomic rename. The application support directory is often on
+  /// a different volume than the user's save directory (for example %APPDATA%
+  /// on C: while the save directory lives on D:), and Windows cannot rename
+  /// across volumes, which used to fail every claim with OS error 17. Staging
+  /// beside the target also keeps the payload on the disk that must hold it.
+  Directory _quickReceiveStaging(File target, String manifestId) => Directory(
+    '${target.parent.path}${Platform.pathSeparator}.jet2drop-receive'
+    '${Platform.pathSeparator}$manifestId',
+  );
+
+  /// Removes one claim's staging directory, and the shared parent when it is
+  /// empty, so neither a finished nor a failed claim leaves anything behind.
+  Future<void> _discardQuickStaging(Directory? staging) async {
+    if (staging == null) return;
+    try {
+      if (await staging.exists()) await staging.delete(recursive: true);
+      final parent = staging.parent;
+      if (await parent.exists() && await parent.list().isEmpty) {
+        await parent.delete();
+      }
+    } on FileSystemException {
+      // An empty leftover staging directory is harmless.
+    }
+  }
+
   Future<void> _runQuickReceiveTask(
     TransferTask task, {
     required QuickTransferManifest manifest,
@@ -3452,10 +3474,7 @@ class AppController extends ChangeNotifier {
               await quickTransfer.checksum(target) == manifest.sha256;
         }
         if (!alreadyDownloaded) {
-          final support = await getApplicationSupportDirectory();
-          staging = Directory(
-            '${support.path}${Platform.pathSeparator}quick-transfer-receive${Platform.pathSeparator}${manifest.id}',
-          );
+          staging = _quickReceiveStaging(target, manifest.id);
           await staging.create(recursive: true);
           final payload = File(
             '${staging.path}${Platform.pathSeparator}${manifest.id}.bin',
@@ -3502,6 +3521,11 @@ class AppController extends ChangeNotifier {
               _notifyTransferProgress();
             },
           );
+          // The payload has been renamed onto the target, so the staging
+          // directory is empty now. Remove it (and the shared parent when no
+          // other claim is staging there) so a finished claim leaves nothing
+          // behind in the user's save directory.
+          await _discardQuickStaging(staging);
         }
         task.status = TransferStatus.finalizing;
         notifyListeners();

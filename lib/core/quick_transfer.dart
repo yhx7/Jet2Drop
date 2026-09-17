@@ -154,6 +154,11 @@ class QuickTransferService {
     final hadTarget = await target.exists();
     if (hadTarget) await target.rename(backup.path);
     try {
+      // The caller stages the payload next to [target], so this stays a
+      // same-volume atomic rename. Windows refuses to rename across volumes
+      // (OS error 17), which is why the staging directory must not live in the
+      // application support directory when the save directory is on another
+      // volume.
       await payload.rename(target.path);
     } catch (_) {
       if (hadTarget && await backup.exists()) await backup.rename(target.path);
