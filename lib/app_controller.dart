@@ -174,6 +174,7 @@ class AppController extends ChangeNotifier {
   bool _quickInitializationActive = false;
   Timer? _quickMaintenanceTimer;
   Future<void>? _directServerStartFuture;
+  Future<void>? _quickBackgroundWork;
   bool _quickMaintenanceInProgress = false;
   bool _quickTransferPageActive = false;
   DateTime? _lastQuickPresenceUpdate;
@@ -243,7 +244,7 @@ class AppController extends ChangeNotifier {
         DateTime.now().difference(lastPresence) >=
             quickTransferInactiveRefreshInterval;
     if (presenceDue) {
-      unawaited(_maintainQuickPresence());
+      _trackQuickBackground(_maintainQuickPresence);
     } else {
       // The 15-second active-page tick only needs message state. Presence
       // maintenance performs the less frequent device refresh every 45
@@ -401,7 +402,7 @@ class AppController extends ChangeNotifier {
       if (!isReady) {
         // Keep direct-server maintenance alive even when the repository could
         // not be reached during startup.
-        unawaited(_initializeQuickTransferSafely());
+        _trackQuickBackground(_initializeQuickTransferSafely);
       }
       if (isReady) unawaited(_restorePendingTransfersSafely());
     } catch (exception) {
@@ -999,7 +1000,7 @@ class AppController extends ChangeNotifier {
         await previousSync?.dispose();
       }
       unawaited(_refreshSyncSnapshot());
-      unawaited(_initializeQuickTransferSafely());
+      _trackQuickBackground(_initializeQuickTransferSafely);
     } catch (_) {
       await localCandidate.dispose();
       await remoteCandidate.dispose();
@@ -1043,7 +1044,7 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       await previous?.dispose();
       if (!identical(previousSync, candidate)) await previousSync?.dispose();
-      unawaited(_initializeQuickTransferSafely());
+      _trackQuickBackground(_initializeQuickTransferSafely);
     } catch (_) {
       await candidate.dispose();
       rethrow;
@@ -1139,7 +1140,7 @@ class AppController extends ChangeNotifier {
       // reconnect spinner open while quick-transfer metadata is prepared.
       notifyListeners();
       if (mode == RepositoryMode.macSync) unawaited(_refreshSyncSnapshot());
-      unawaited(_initializeQuickTransferSafely());
+      _trackQuickBackground(_initializeQuickTransferSafely);
     } catch (exception) {
       error = describeError(exception);
       needsTailscale = _isTailscaleConnectivityError(exception);
@@ -1345,7 +1346,7 @@ class AppController extends ChangeNotifier {
     }
     await refresh();
     unawaited(_startDirectTransferServer());
-    unawaited(_maintainQuickPresence());
+    _trackQuickBackground(_maintainQuickPresence);
   }
 
   Future<void> _refreshSyncSnapshot() async {
@@ -4013,6 +4014,26 @@ class AppController extends ChangeNotifier {
     _quickRefreshGeneration++;
     _quickMaintenanceTimer?.cancel();
     _transferUiTimer?.cancel();
+    // Stop in-flight transfers as well: their writers keep touching the
+    // repository until the next checkpoint, and a caller may delete that
+    // repository as soon as dispose returns.
+    for (final control in _transferControls.values.toList(growable: false)) {
+      unawaited(control.cancel());
+    }
+  }
+
+  /// Runs quick-transfer background work that writes to the repository, and
+  /// remembers it so [dispose] can wait for it.
+  ///
+  /// The maintenance timer and connection changes start repository writes in
+  /// the background. One that lands after disposal would fail against a
+  /// repository the caller has already torn down.
+  void _trackQuickBackground(Future<void> Function() work) {
+    final operation = work().then<void>((_) {}, onError: (_, _) {});
+    final previous = _quickBackgroundWork;
+    _quickBackgroundWork = previous == null
+        ? operation
+        : Future.wait<void>([previous, operation]).then<void>((_) {});
   }
 
   Future<void> _disposeResources() => _resourceDisposalFuture ??= () async {
@@ -4020,6 +4041,22 @@ class AppController extends ChangeNotifier {
       await _directServerStartFuture;
     } catch (_) {
       // Startup errors are already exposed by the regular connection state.
+    }
+    // Tracked background work writes to the repository, so let it finish (or
+    // give up) before the gateways close and before the caller can delete the
+    // repository they point at. A slow write must not block shutdown.
+    try {
+      await _quickBackgroundWork?.timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // Shutdown continues regardless of a background write that failed.
+    }
+    // Wait for the transfers cancelled above to stop touching the repository.
+    // Each transfer removes its control when it finishes, so an empty map
+    // means nothing is still writing. Bounded, so a stuck transfer cannot
+    // block shutdown.
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (_transferControls.isNotEmpty && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
     }
     await Future.wait<void>([
       _stopDirectTransferServer(),
