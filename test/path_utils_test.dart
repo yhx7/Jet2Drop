@@ -9,6 +9,7 @@ import 'package:jet2drop/core/connection_retry.dart';
 import 'package:jet2drop/core/transfer_control.dart';
 import 'package:jet2drop/infrastructure/local_repository_gateway.dart';
 import 'package:jet2drop/infrastructure/serialized_repository_gateway.dart';
+import 'support/temp_directory.dart';
 
 void main() {
   test('normalizes platform separators without traversal', () {
@@ -34,7 +35,7 @@ void main() {
 
   test('describes and verifies a checksummed payload', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-test-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final source = File('${root.path}${Platform.pathSeparator}photo.jpg');
     final bytes = List<int>.generate(100000, (index) => index % 251);
     await source.writeAsBytes(bytes);
@@ -69,7 +70,7 @@ void main() {
 
   test('local repository uploads atomically and downloads bytes', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-repo-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
     final source = File('${root.path}/source.bin');
@@ -116,7 +117,7 @@ void main() {
 
   test('dot-prefixed local entries are hidden only on macOS', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-hidden-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     await File('${root.path}/.user-data').writeAsString('test');
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
@@ -127,7 +128,7 @@ void main() {
 
   test('resumed download checksum covers the bytes already on disk', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-resume-hash-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
     addTearDown(gateway.dispose);
@@ -157,7 +158,7 @@ void main() {
     'serialized gateway preserves operations after a failed request',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-serial-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final gateway = SerializedRepositoryGateway(
         LocalRepositoryGateway(root.path),
       );
@@ -239,7 +240,7 @@ void main() {
 
   test('local upload resumes a stable partial file', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-resume-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
     final bytes = List<int>.generate(128 * 1024, (index) => index % 251);
@@ -275,7 +276,7 @@ void main() {
 
   test('deferring an upload preserves its partial for the next task', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-yield-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
     final bytes = List<int>.generate(256 * 1024, (index) => index % 251);
@@ -327,7 +328,7 @@ void main() {
 
   test('temporary recovery restores backups and removes stale parts', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-recovery-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
     final backup = File(
@@ -356,7 +357,7 @@ void main() {
     'local overwrite replaces bytes without leaving upload fragments',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-overwrite-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final gateway = LocalRepositoryGateway(root.path);
       await gateway.initialize();
       final first = File('${root.path}${Platform.pathSeparator}first.bin');
@@ -392,7 +393,7 @@ void main() {
 
   test('cancelled local upload cleans its temporary file', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-cancel-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final gateway = LocalRepositoryGateway(root.path);
     await gateway.initialize();
     final source = File('${root.path}${Platform.pathSeparator}source.bin');

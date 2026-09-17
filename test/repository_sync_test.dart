@@ -8,6 +8,7 @@ import 'package:jet2drop/core/repository_gateway.dart';
 import 'package:jet2drop/core/repository_sync.dart';
 import 'package:jet2drop/core/transfer_control.dart';
 import 'package:jet2drop/infrastructure/local_repository_gateway.dart';
+import 'support/temp_directory.dart';
 
 void main() {
   late Directory root;
@@ -30,9 +31,7 @@ void main() {
     await engine.remote.initialize();
   });
 
-  tearDown(() async {
-    if (await root.exists()) await root.delete(recursive: true);
-  });
+  tearDown(() => deleteTempDirectory(root));
 
   test(
     'first pull copies the complete remote repository and baseline',

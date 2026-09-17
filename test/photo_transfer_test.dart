@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jet2drop/core/photo_transfer.dart';
+import 'support/temp_directory.dart';
 
 void main() {
   test(
@@ -12,7 +13,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-photo-http-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final sourceDirectory = Directory(
         '${root.path}${Platform.pathSeparator}source',
       );
@@ -75,7 +76,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-photo-fail-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final server = PhotoTransferServer(
         token: 'photo-test-token',
         bindAddress: InternetAddress.loopbackIPv4,
@@ -138,7 +139,7 @@ void main() {
 
   test('photo endpoint response remains machine-readable', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-photo-json-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final server = PhotoTransferServer(
       token: 'token',
       bindAddress: InternetAddress.loopbackIPv4,
@@ -170,7 +171,7 @@ void main() {
 
   test('a directory change only affects requests that start later', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-photo-dir-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final first = Directory('${root.path}${Platform.pathSeparator}first');
     final second = Directory('${root.path}${Platform.pathSeparator}second');
     await first.create();

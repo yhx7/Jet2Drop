@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jet2drop/core/photo_transfer.dart';
 import 'package:jet2drop/core/transfer_control.dart';
+import 'support/temp_directory.dart';
 
 const _token = 'direct-test-token';
 
@@ -322,7 +323,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-direct-drop-',
       );
-      addTearDown(() => _deleteDirectoryWithRetry(root));
+      addTearDown(() => deleteTempDirectory(root));
       final dropping = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(() => dropping.close(force: true));
       dropping.listen((request) async {
@@ -745,7 +746,7 @@ void main() {
         final root = await Directory.systemTemp.createTemp(
           'jet2drop-direct-legacy-receiver-',
         );
-        addTearDown(() => _deleteDirectoryWithRetry(root));
+        addTearDown(() => deleteTempDirectory(root));
         final legacyReceiver = await HttpServer.bind(
           InternetAddress.loopbackIPv4,
           0,
@@ -835,7 +836,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-direct-probe-',
       );
-      addTearDown(() => _deleteDirectoryWithRetry(root));
+      addTearDown(() => deleteTempDirectory(root));
       String? selectedDirectory = root.path;
       final directoryServer = DirectTransferServer(
         token: 'directory-probe-token',
@@ -983,7 +984,7 @@ void main() {
         final root = await Directory.systemTemp.createTemp(
           'jet2drop-direct-bind-',
         );
-        addTearDown(() => _deleteDirectoryWithRetry(root));
+        addTearDown(() => deleteTempDirectory(root));
         final server = DirectTransferServer(
           token: 'bind-token',
           bindAddress: InternetAddress.anyIPv4,
@@ -1019,21 +1020,10 @@ Future<_Receiver> _startReceiver({
   // after the test body finished, so the cleanup is retried instead of racing
   // the receiver's own close.  Teardowns run in reverse registration order, so
   // [server.stop] is registered last and therefore runs first.
-  addTearDown(() => _deleteDirectoryWithRetry(root));
+  addTearDown(() => deleteTempDirectory(root));
   addTearDown(server.stop);
   expect(await server.start(), isTrue);
   return _Receiver(root, server);
-}
-
-Future<void> _deleteDirectoryWithRetry(Directory root) async {
-  for (var attempt = 0; attempt < 20; attempt++) {
-    try {
-      if (await root.exists()) await root.delete(recursive: true);
-      return;
-    } on FileSystemException {
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-    }
-  }
 }
 
 Future<List<File>> _partFiles(Directory root) async =>

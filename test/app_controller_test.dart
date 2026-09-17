@@ -12,6 +12,7 @@ import 'package:jet2drop/core/repository_gateway.dart';
 import 'package:jet2drop/core/transfer_control.dart';
 import 'package:jet2drop/infrastructure/sftp_repository_gateway.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'support/temp_directory.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -77,7 +78,7 @@ void main() {
 
   test('concurrent connect requests share one operation', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-connect-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory(
       '${root.path}${Platform.pathSeparator}repository',
     );
@@ -96,7 +97,7 @@ void main() {
 
   test('download is complete only after its final save succeeds', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-controller-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     await File(
@@ -139,7 +140,7 @@ void main() {
     'quick receive directory is persisted and changed without fallback',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-save-dir-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       final firstSave = Directory(
         '${root.path}${Platform.pathSeparator}first-save',
@@ -181,7 +182,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-save-invalid-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -202,7 +203,7 @@ void main() {
 
   test('sanitized duplicate selections never overwrite one another', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-names-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final firstDirectory = Directory(
@@ -240,7 +241,7 @@ void main() {
 
   test('file operation failures remain visible to the caller', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-errors-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final controller = await createController(repository);
@@ -257,7 +258,7 @@ void main() {
     'a damaged pending record does not discard valid recovery tasks',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-recovery-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final source = File('${root.path}${Platform.pathSeparator}pending.bin');
@@ -314,7 +315,7 @@ void main() {
 
   test('quick inbox refresh stays quiet while a send is active', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-quick-flow-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final source = File('${root.path}${Platform.pathSeparator}payload.bin');
@@ -354,7 +355,7 @@ void main() {
 
   test('repository flow works from create through delete', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-repo-flow-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final source = File('${root.path}${Platform.pathSeparator}source.txt');
@@ -392,7 +393,7 @@ void main() {
 
   test('same-name choices preserve the requested result', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-conflict-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     await File(
@@ -422,7 +423,7 @@ void main() {
     'multiple uploads settle independently and leave no active state',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-multi-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final first = File('${root.path}${Platform.pathSeparator}first.bin');
@@ -459,7 +460,7 @@ void main() {
 
   test('sorting, theme and finished-task cleanup behave immediately', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-state-flow-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     await File(
@@ -494,7 +495,7 @@ void main() {
     'selection limits reject missing, excessive-count and oversized input',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-limits-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -526,7 +527,7 @@ void main() {
 
   test('quick transfer can be sent, received, claimed and deleted', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-quick-e2e-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final source = File('${root.path}${Platform.pathSeparator}photo.bin');
@@ -577,7 +578,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-photo-route-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       final photos = Directory('${root.path}${Platform.pathSeparator}photos');
       await repository.create();
@@ -655,7 +656,7 @@ void main() {
 
   test('photo route requires matching image MIME and extension', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-photo-type-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final source = File('${root.path}${Platform.pathSeparator}photo.jpg');
@@ -699,7 +700,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-photo-refresh-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       final photos = Directory('${root.path}${Platform.pathSeparator}photos');
       await repository.create();
@@ -776,7 +777,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-device-cache-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -825,7 +826,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-quick-delete-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final source = File('${root.path}${Platform.pathSeparator}payload.bin');
@@ -882,7 +883,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-quick-delete-ui-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -916,7 +917,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-quick-stale-manifest-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -967,7 +968,7 @@ void main() {
     final root = await Directory.systemTemp.createTemp(
       'jet2drop-quick-double-claim-',
     );
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final repository = Directory('${root.path}${Platform.pathSeparator}repo');
     await repository.create();
     final controller = await createController(repository);
@@ -1023,7 +1024,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-quick-missing-payload-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -1076,7 +1077,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-quick-claimed-payload-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final controller = await createController(repository);
@@ -1163,7 +1164,7 @@ void main() {
       final root = await Directory.systemTemp.createTemp(
         'jet2drop-quick-pause-',
       );
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final first = File(
@@ -1238,7 +1239,7 @@ void main() {
     'quick mode defaults to direct and persists the explicit selection',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-mode-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       SharedPreferences.setMockInitialValues({
@@ -1263,7 +1264,7 @@ void main() {
     'direct quick send probes, exposes direct capabilities and is not persisted',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-direct-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final repository = Directory('${root.path}${Platform.pathSeparator}repo');
       await repository.create();
       final source = File('${root.path}${Platform.pathSeparator}payload.bin');
@@ -1317,7 +1318,7 @@ void main() {
     'an explicit direct request to Android is rejected instead of downgraded',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-android-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final source = File('${root.path}${Platform.pathSeparator}payload.bin');
       await source.writeAsBytes([1, 2, 3]);
       final direct = _FakeDirectTransferClient();
@@ -1350,7 +1351,7 @@ void main() {
     'reliable relay falls back to direct only for a pre-start outage',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-fallback-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final source = File('${root.path}${Platform.pathSeparator}payload.bin');
       await source.writeAsBytes([5, 6, 7]);
       final direct = _FakeDirectTransferClient();
@@ -1396,7 +1397,7 @@ void main() {
     'relay outage fails before task creation when direct target is unavailable',
     () async {
       final root = await Directory.systemTemp.createTemp('jet2drop-no-route-');
-      addTearDown(() => root.delete(recursive: true));
+      addTearDown(() => deleteTempDirectory(root));
       final source = File('${root.path}${Platform.pathSeparator}payload.bin');
       await source.writeAsBytes([5, 6, 7]);
       final direct = _FakeDirectTransferClient(canReceive: false);
@@ -1440,7 +1441,7 @@ void main() {
 
   test('relay authentication failure never switches to direct', () async {
     final root = await Directory.systemTemp.createTemp('jet2drop-auth-');
-    addTearDown(() => root.delete(recursive: true));
+    addTearDown(() => deleteTempDirectory(root));
     final source = File('${root.path}${Platform.pathSeparator}payload.bin');
     await source.writeAsBytes([8]);
     final direct = _FakeDirectTransferClient();
