@@ -1672,6 +1672,12 @@ class AppController extends ChangeNotifier {
     if (exception is SocketException) {
       return '网络连接失败，请检查网络和 Tailscale 连接状态。';
     }
+    if (exception is FileSystemException) {
+      // Filesystem failures used to fall through to the generic message, which
+      // hid causes such as a publish that could not cross volumes. Name the
+      // save location instead, because that is the part the user can act on.
+      return '读写文件失败，请检查保存目录是否可写、剩余空间是否充足，然后重试。';
+    }
     return '操作失败。请稍后重试；若持续发生，请检查连接设置和网络状态。';
   }
 
@@ -1681,6 +1687,8 @@ class AppController extends ChangeNotifier {
     await _loadCachedQuickDevices();
     if (generation != _quickSessionGeneration) return;
     await _startDirectTransferServer();
+    if (generation != _quickSessionGeneration) return;
+    await _discardLegacyQuickStaging();
     if (generation != _quickSessionGeneration) return;
     await _cacheLocalQuickDevice();
     if (generation != _quickSessionGeneration) return;
@@ -2114,6 +2122,7 @@ class AppController extends ChangeNotifier {
               _quickManifestCache.remove(manifestPath);
               final transferId = _quickTransferIdFromManifestPath(manifestPath);
               if (transferId != null) _removeQuickInboxItem(transferId);
+              await _discardAbandonedQuickPackage(gateway, manifestPath);
               continue;
             }
             Error.throwWithStackTrace(exception, stackTrace);
@@ -3446,6 +3455,36 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  /// Removes staging directories left behind by builds that staged claimed
+  /// payloads in the application support directory.
+  ///
+  /// Those claims could never publish onto a save directory on another volume
+  /// and abandoned their staging copy, which nothing else cleans up because
+  /// the new code stages beside the save directory instead. Anything older
+  /// than a day is abandoned; a live claim never lasts that long.
+  Future<void> _discardLegacyQuickStaging() async {
+    try {
+      final support = await getApplicationSupportDirectory();
+      final legacy = Directory(
+        '${support.path}${Platform.pathSeparator}quick-transfer-receive',
+      );
+      if (!await legacy.exists()) return;
+      final cutoff = DateTime.now().subtract(const Duration(days: 1));
+      await for (final entity in legacy.list(followLinks: false)) {
+        try {
+          if ((await entity.stat()).modified.isAfter(cutoff)) continue;
+          await entity.delete(recursive: true);
+        } on FileSystemException {
+          // Leave anything that is still in use for the next start.
+        }
+      }
+      if (await legacy.list().isEmpty) await legacy.delete();
+    } on FileSystemException {
+      // Legacy staging is garbage from older builds; failing to remove it must
+      // never affect startup.
+    }
+  }
+
   Future<void> _runQuickReceiveTask(
     TransferTask task, {
     required QuickTransferManifest manifest,
@@ -3843,6 +3882,31 @@ class AppController extends ChangeNotifier {
       await _gateway?.recoverTemporaryFiles(path);
     } catch (_) {
       // Recovery is maintenance and must not make a healthy folder unusable.
+    }
+  }
+
+  /// Removes a relay package that never got a manifest.
+  ///
+  /// The payload is uploaded before the manifest, so a directory without a
+  /// manifest is either an upload still in progress or one that was abandoned.
+  /// Repository temp-file recovery removes the leftover payload partial only
+  /// once it is older than its cutoff, after which the now-empty directory is
+  /// removed too; the non-recursive delete fails harmlessly while anything is
+  /// still in use. Without this, an aborted upload stayed in the repository
+  /// forever, because the expiry sweep only runs for readable manifests.
+  Future<void> _discardAbandonedQuickPackage(
+    RepositoryGateway gateway,
+    String manifestPath,
+  ) async {
+    final packagePath = manifestPath.substring(
+      0,
+      manifestPath.length - '/manifest.json'.length,
+    );
+    try {
+      await gateway.recoverTemporaryFiles(packagePath);
+      await gateway.deleteEntry(packagePath, recursive: false);
+    } catch (_) {
+      // Still in use or not removable right now; the next refresh retries.
     }
   }
 
