@@ -3,9 +3,7 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 
 class DesktopLifecycleBridge {
-  static const _windowsChannel = MethodChannel(
-    'jet2drop/windows_lifecycle',
-  );
+  static const _windowsChannel = MethodChannel('jet2drop/windows_lifecycle');
   static const _macosChannel = MethodChannel('jet2drop/macos_lifecycle');
 
   static MethodChannel? get _channel {
